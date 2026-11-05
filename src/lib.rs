@@ -29,12 +29,12 @@ pub fn plan_log(
     cwd: &Path,
     registry: &registry::Registry,
 ) -> Result<graph::BuildGraph> {
-    let jobs = log
-        .commands
+    let (commands, diagnostics) = log.into_parts();
+    let jobs = commands
         .into_iter()
-        .map(|source| registry.classify(source))
+        .map(|record| registry.classify_parsed(record))
         .collect::<Result<Vec<_>>>()?;
     let mut graph = graph::BuildGraph::new(jobs, cwd)?;
-    graph.diagnostics = log.diagnostics;
+    graph.diagnostics = diagnostics;
     Ok(graph)
 }

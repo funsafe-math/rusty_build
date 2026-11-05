@@ -416,6 +416,7 @@ mod tests {
                 stdout: None,
                 stderr: None,
                 append_stdout: false,
+                noop_fallback: false,
             };
             assert_eq!(Compiler::parse(&shell).unwrap().argv, argv);
         }

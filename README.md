@@ -3,9 +3,10 @@
 A conservative Rust proof of concept for executing GNU Make command logs with
 native filesystem operations, dependency-safe batches, a copy-chain rewrite, and
 a persistent content cache. GNU Make expands Makefiles; this tool does not parse
-Makefiles or implement a shell. Linux with Bash is the supported execution host.
-Windows-looking paths are tested as Bash arguments, **not** as Windows shell syntax.
-No Windows performance or compatibility claim is made.
+Makefiles or implement a shell. Command logs use Bash syntax on every host.
+Windows execution assumes Bash is available and log paths use forward slashes;
+it does not interpret cmd.exe or PowerShell syntax. Runtime verification is
+currently on Linux, not a Windows machine.
 
 ## Build and run
 
@@ -137,15 +138,17 @@ flowchart LR
 * `input.rs`: physical source line and original command spelling; Make target
   context; active Bash backslash-newline continuations. Open quotes, heredocs and
   compound constructs spanning independent physical records are rejected. One-line
-  compound commands may remain external. CRLF records work; CRLF continuations do
-  not masquerade as Bash continuations.
+  compound commands may remain external. CRLF delimiters and active backslash-CRLF
+  continuations normalize to LF, retaining physical source positions and literal
+  escaped sequences.
 * `shell.rs`: **tree-sitter-bash** identifies shell structure and validates the
-  whole tree; **shell-words** decodes only proven static words. This was chosen
-  over a shell interpreter because the PoC needs syntax boundaries and can defer
-  expansion to Bash. Tree-sitter is error-recovering, not an authoritative Bash
-  validator, so opaque constructs also receive `bash -n` syntax-only validation.
-  No shell expansion runs during parsing. Static commands incur no syntax-check
-  subprocess. Parser reference: [tree-sitter-bash Rust API](https://docs.rs/tree-sitter-bash/0.25.1/tree_sitter_bash/).
+  whole tree; **shell-words** decodes only proven static words. Each input command
+  is parsed once with a reusable in-process parser; classification consumes its
+  immutable parsed record. **Parsing and classification create zero subprocesses**,
+  including for opaque syntax. Recovery/missing trees and incomplete constructs
+  fail conservatively; unsupported grammar recovery is not delegated to Bash.
+  No shell expansion runs during parsing. Parser reference:
+  [tree-sitter-bash Rust API](https://docs.rs/tree-sitter-bash/0.25.1/tree_sitter_bash/).
 * `registry.rs`: deterministic registered regex order. **Every matching regex
   counts**, including overlaps within one handler; there are no priorities or
   specificity rules. Exactly one match dispatches the typed parser; rejection is
@@ -188,9 +191,26 @@ flowchart LR
   `provenance`. The opt-in unity example demonstrates a separate compiler graph
   transform; it is not enabled by normal CLI optimization.
 
-The graph uses pairwise hazard comparisons (quadratic in command count), not a
-fully sequential chain. This favors a small, auditable implementation over a
-premature indexed dependency engine. No throughput/speedup benchmark is claimed.
+The graph indexes actual path hazards and uses sink-frontier edges for implicit
+barriers, avoiding unrelated-pair scans and redundant all-pairs barrier edges.
+Normalization and filesystem identity observations are cached only within one
+rebuild. Real conflicting paths can still produce dense edges; backward explicit
+generated-header hoists retain exact barrier relations to preserve cycle checks.
+The copy-chain pass does not rebuild an unchanged graph.
+
+Local debug-build measurements, mean of five runs on Linux, for 1,000 commands:
+
+| Input | Parse only | Parse + library planning | Full CLI dry-run | Edges |
+| --- | ---: | ---: | ---: | ---: |
+| Alternating native copies and compiler commands | 31.4 ms | 118.6 ms | 154.0 ms | 999 |
+| Opaque sed pipelines | 31.1 ms | 41.4 ms | 72.0 ms | 999 |
+
+Library planning excludes registry construction; full CLI timing includes startup,
+rewrites and dry-run output, with output discarded. These are sanity measurements,
+not timing assertions or a Windows performance guarantee. `strace -f -e trace=process`
+observed only each CLI's initial `execve` and exit: no child creation during either
+dry-run. The existing ambiguity-preserving regex matching remains simple; no
+RegexSet/cache framework or first-match dispatch was added.
 
 ### Runtime behavior and persistent plans
 
@@ -311,13 +331,36 @@ arbitrary C source/link equivalence.
 | `cp SRC DST` | In-process regular-file copy; existing destination permissions retained; new mode respects umask | Exactly two operands; directories, symlink operands, special bits and multiply-linked destinations rejected; no flags |
 | `mkdir [-p\|--parents] PATH...` | Native creation; intermediate owner write/search for `-p` | Mode options rejected; overlapping directory effects ordered |
 | `touch PATH...` | Native creation or atime/mtime update | Ordinary files only; no options; never skipped |
-| `rm [-f\|--force] PATH...` | Native unlink; force ignores missing paths | No recursion/options beyond force; global barrier; never skipped |
+| `rm [-f] [-r\|-R\|--recursive] PATH...` | Native unlink and recursive tree removal; combined `-rf`/`-fr`; force ignores missing operands | Never follows symlink targets; rejects symlink ancestors, root/`.`/`..` and directory-only operands naming regular files before deletion; barrier; never skipped |
 | `mv SRC DST` | Native regular-file rename | Same filesystem; no options, directory/symlink/multiply-linked destination behavior; barrier; never skipped |
 | `sed` | Typed `-e`, `-f`, `-n`, `-i[SUFFIX]`, operands; original command executed | No native sed/semantic inference; arbitrary scripts are global barriers and never cached |
+| `coan` | External argv execution with diagnostic-bitmask status handling; compatible closed replacement jobs batch | Precise effects require explicit safe replacement files; uncertain forms remain barriers; no cache hits |
+| `gawk` | External argv execution; preserves inline programs, script files, assignments, separators and operands | Arbitrary script effects stay unknown; no output inference, native interpreter or cache hits |
 | GCC/Clang/`cc`/C++ drivers | Typed include/library paths and common flags; partial source/output metadata | Unknown flags/response files preserved; conservative effects and no cache hits; explicit generated-header policy can order known prerequisites |
 | Binary inspection and manipulation tools | Separate identities, original argv/redirections, typed file-effect subsets; GNU/LLVM/cross-prefixed names recognized | Known forms use ordinary file hazards, not global barriers; uncertain forms remain passthrough barriers; no native implementation or cache hits |
-| Configured Python scripts | Independent identities across `python`, `python3[.N]`, `py`, absolute POSIX interpreter paths | No guessed script dependencies or interpreter options; original-text execution/barrier |
+| Configured Python scripts | Independent identities across `python`, `python3[.N]`, `py` and their `.exe` forms; static argv executes directly | No guessed script dependencies or interpreter options; meaningful shell decoration uses original text; barrier |
 | Other programs | Visible `unknown:` external jobs | Unknown filesystem effects ordered against all other jobs |
+
+`> /dev/null` and `2> /dev/null`, separately or together, are stream sinks, not
+filesystem artifacts. Typed external commands use native null streams, including
+on Windows; native filesystem jobs need no shell for null-only decoration.
+Windows also recognizes native `NUL`/`NUL:`; a POSIX file named `NUL` remains a file.
+The exact sole `COMMAND || cd .` suffix exposes the left command for parsing,
+retaining original text. Ordinary execution preserves its Bash failure mask;
+coan intentionally ignores this redundant fallback and applies its own status
+policy. Other lists, pipelines and descriptor aliasing remain opaque.
+
+Compilation databases format `directory`, `file`, `output` and recognized compiler
+path operands using ordinary forward-slash Windows paths, e.g.
+`"directory": "C:/path/to/something"`, without `\\?\C:` prefixes. This is path-aware
+formatting, not replacement across command text: defines, regexes, unknown option
+values and original argv/provenance are not rewritten. Export hooks receive the
+graph and can edit entries; paths they introduce are formatted in the serialization
+copy without overwriting their in-memory values.
+
+Windows filesystem identity support remains conservative: native copy/move over
+existing destinations can be rejected when safe link identity is unavailable.
+Coan precision/batching is disabled on non-Unix hosts; external execution remains.
 
 Compiler include and library search paths support both separated and joined
 forms: `-I include`, `-Iinclude`, `-L lib`, `-Llib`, including quoted paths with
@@ -371,9 +414,9 @@ and `dwp`. LLVM equivalents and `llvm-readobj`, `llvm-dwarfdump` and
 `llvm-symbolizer` are recognized, including `llvm-cxxfilt`. Matching also covers
 target prefixes (`arm-none-eabi-nm`), absolute/quoted POSIX executable paths,
 numeric version suffixes (`llvm-objdump-18`), lowercase `.exe` spellings, and
-`ld.bfd`, `ld.gold`, `ld.lld`, `gold` and `lld`. Recognition of `.exe` names is not
-Windows shell support. LLVM names are classification-tested; runtime verification
-uses the installed GNU tools.
+`ld.bfd`, `ld.gold`, `ld.lld`, `gold` and `lld`. Windows uses the same Bash syntax
+and forward-slash input paths, not Windows shell quoting. LLVM names are
+classification-tested; runtime verification uses the installed GNU tools.
 
 All options are passed through unchanged, including options unknown to rusty_make.
 The executable must be installed; its exit status determines success. External
@@ -587,7 +630,7 @@ For another opaque binary tool, use
 all arguments and shell semantics without writing a flag parser; unknown effects
 still force a barrier. Its patterns obey the same fatal ambiguity rules.
 
-### External coan batching
+### External coan and gawk
 
 Coan remains an external tool. With `source --replace` and **no filename
 operands**, stdin supplies filenames rather than source text:
@@ -597,16 +640,26 @@ printf '"%s"\n' src/a.c 'src/b with spaces.c' |
   coan source --replace -DFEATURE=1
 ```
 
-This is coan's quoted/whitespace-delimited filename format, not a NUL-delimited
-stream or general shell quoting; filenames containing quotes/newlines need a
-different input method. One reference invocation was verified to replace both
-files, including the spaced filename.
+The `Coan` job batches independent, closed `source --replace`/`-r` jobs with
+compatible argv and stdout/stderr quiet settings into one real invocation using
+that quoted filename-list format. Quote/newline filenames, uncertain modes,
+aliases, directories and meaningful file redirections do not use this batching
+path. Missing generated regular files can remain conditionally precise, but every
+target is revalidated before execution. Aggregate failure certifies no per-file
+successes.
 
-Coan exit codes are diagnostic/change bitmasks. The successful batch above
-returned **17** (information plus dropped lines); error/abend bits are `4` and `8`.
-A coan-aware caller must interpret the flags and process termination correctly.
-The generic opaque-job executor still treats nonzero status as failure: this
-change does not add automatic coan batching or a coan-specific status adapter.
+Coan exit codes are diagnostic/change bitmasks: **17** (information plus dropped
+lines) succeeds; error/abend bits `4` and `8`, signals and startup failures fail.
+Null streams do not hide these errors, and the recognized `|| cd .` filler is
+ignored by this handler rather than masking genuine failures. Coan remains an
+external dependency. Real-tool tests use `coan` from PATH or `RUSTY_MAKE_COAN`.
+The available coan 6.0.1 reference rejects source-from-stdin with a `[stdin]`
+real-path error; invocation semantics are preserved, not worked around. Its
+replacement filename-list stdin mode is verified.
+
+The `Gawk` job models common `-f`/`--file`, `-e`/`--source`, `-F` and `-v`
+arguments but never interprets programs to invent outputs. Script execution and
+unknown options remain external, globally ordered and uncacheable.
 
 
 
@@ -629,8 +682,8 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **205 passed**, no failures, including real compiler, Python, sed,
-  Make and differential fixture execution.
+* `cargo test`: **270 passed** across 23 suites, no failures, including real coan,
+  gawk, compiler, Python, sed, Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
   database were written and inspected.
@@ -679,6 +732,13 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 * Rayon execution regression: six independent file-producing batches make parallel
   progress with `--jobs=2`, never exceeding that bound; `--jobs=1` remains serial.
   Failure cancellation and successful-only cache persistence remain covered.
+* CRLF/null-stream CLI smoke: a continued native copy, recursive removal, gawk and
+  two quiet coan replacements executed six jobs in five batches. Gawk wrote `42`;
+  both coan files became `kept`, and original physical source lines were retained.
+* Windows compilation-database export smoke: a verbatim native directory exported
+  as `C:/work/project`; executable/source/output paths retained forward slashes
+  while a regex-valued define kept its meaningful backslash. No Windows binary
+  was executed on this host.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings
@@ -689,8 +749,8 @@ Recommended next work, in order:
 
 1. GCC/Clang depfiles and an audited header/tool/environment dependency model.
 2. Proven script-specific Python effects and native implementations for hot scripts.
-3. An indexed hazard builder and event-driven ready queue; parallel typed batch shards.
-4. An explicit shell/backend and path policy for Windows, verified on Windows CI.
+3. An event-driven ready queue and parallel typed batch shards.
+4. Windows runtime/CI verification and native filesystem identity support.
 5. Pinned, individually audited uutils lower-level APIs where broader GNU semantics
    justify their footprint; benchmark real workloads before new fusion passes.
 6. Recursive Make working-directory/protocol support and planning sandboxing.

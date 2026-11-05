@@ -1,6 +1,6 @@
 use crate::{
     commands::{self, external::External, python::Python},
-    input::SourceCommand,
+    input::{ParsedCommand, SourceCommand},
     job::{Job, JobRecord, JobSnapshot},
     shell::{self, ShellCommand},
 };
@@ -176,17 +176,37 @@ impl Registry {
     pub fn classify(&self, source: SourceCommand) -> Result<JobRecord> {
         let shell = shell::parse(&source.text)
             .with_context(|| format!("invalid shell on line {}", source.line))?;
-        let mut matches = Vec::new();
+        self.classify_parts(source, shell)
+    }
+
+    pub(crate) fn classify_parsed(&self, record: ParsedCommand) -> Result<JobRecord> {
+        let (source, shell) = record.into_parts();
+        self.classify_parts(source, shell)
+    }
+
+    fn classify_parts(
+        &self,
+        source: SourceCommand,
+        shell: Option<ShellCommand>,
+    ) -> Result<JobRecord> {
+        // The ordinary zero/one-match path needs no match-list allocation.
+        let mut first = None;
+        let mut overlaps = Vec::new();
         for (handler_index, handler) in self.handlers.iter().enumerate() {
             for (pattern_index, pattern) in handler.patterns.iter().enumerate() {
                 if pattern.is_match(&source.text) {
-                    matches.push((handler_index, pattern_index));
+                    if first.is_none() {
+                        first = Some((handler_index, pattern_index));
+                    } else {
+                        overlaps.push((handler_index, pattern_index));
+                    }
                 }
             }
         }
-        if matches.len() > 1 {
-            let descriptions = matches
+        if !overlaps.is_empty() {
+            let descriptions = first
                 .iter()
+                .chain(overlaps.iter())
                 .map(|&(handler, pattern)| {
                     format!(
                         "  {}[{}]: {}",
@@ -201,10 +221,10 @@ impl Registry {
                 "ambiguous command classification on line {}: {}\n{} matching patterns\nMatching patterns:\n{descriptions}",
                 source.line,
                 source.text,
-                matches.len()
+                overlaps.len() + 1
             );
         }
-        let Some(&(handler_index, _)) = matches.first() else {
+        let Some((handler_index, _)) = first else {
             println!("{UNKNOWN_PREFIX}{}", source.text);
             let job = shell.as_ref().map_or_else(
                 || External::opaque("unknown"),
@@ -250,14 +270,27 @@ fn compile_patterns(classification: &str, patterns: &[&str]) -> Result<Vec<Regex
         })
         .collect()
 }
+/// Match Bash command spellings, not decoded/reinterpreted argument paths.
+/// Backslash path separators are native only on Windows; unquoted spellings
+/// must escape them twice, while quotes retain them under Bash quoting rules.
 pub fn command_pattern(programs: &str) -> String {
+    let program = format!(r"(?:{programs})(?:\.exe)?");
+    let (unquoted, single, double) = if cfg!(windows) {
+        (
+            r#"(?:[^\s'\";|&<>]*(?:/|\\\\))?"#,
+            r"(?:[^']*[/\\])?",
+            r#"(?:[^\"]*[/\\])?"#,
+        )
+    } else {
+        (r#"(?:[^\s'\";|&<>]*/)?"#, r"(?:[^']*/)?", r#"(?:[^\"]*/)?"#)
+    };
     format!(
-        r#"^\s*(?:(?:[^\s'\";|&<>]*/)?(?:{programs})|'(?:[^']*/)?(?:{programs})'|\"(?:[^\"]*/)?(?:{programs})\")(?:\s|$|[<>;&|])"#
+        r#"^\s*(?:{unquoted}{program}|'{single}{program}'|\"{double}{program}\")(?:\s|$|[<>;&|])"#
     )
 }
 pub fn binary_pattern(programs: &str) -> String {
     command_pattern(&format!(
-        r"(?:[A-Za-z0-9_+.]+-)*(?:{programs})(?:-[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?"
+        r"(?:[A-Za-z0-9_+.]+-)*(?:{programs})(?:-[0-9]+(?:\.[0-9]+)*)?"
     ))
 }
 

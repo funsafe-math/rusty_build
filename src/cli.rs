@@ -113,7 +113,7 @@ impl Cli {
             args.extend(self.make_args);
             crate::make::plan(&args, &cwd)?
         };
-        let count = log.commands.len();
+        let count = log.commands().len();
         let mut graph = crate::plan_log(log, &cwd, &registry)?;
         eprintln!("[PLAN] Parsed {count} commands");
         if !self.no_optimize {

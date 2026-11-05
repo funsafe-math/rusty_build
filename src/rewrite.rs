@@ -71,7 +71,9 @@ impl GraphRewrite for CopyChain {
             self.name(),
             stats.transformations
         ));
-        graph.rebuild()?;
+        if stats.transformations != 0 {
+            graph.rebuild()?;
+        }
         Ok(stats)
     }
 }

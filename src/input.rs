@@ -5,13 +5,16 @@
 //! and compound statements are not implicitly assembled across log records.
 //! Make trace lines attach target metadata to subsequent recipes. Diagnostics
 //! never become commands, and failed Make logs or directory-scoped recipes are
-//! rejected before execution. CRLF record delimiters are accepted, but CRLF
-//! continuations are rejected because Bash does not treat `\\\r\n` as `\\\n`.
+//! rejected before execution. CRLF physical delimiters, including active
+//! backslash-CRLF continuations, are normalized to LF without changing literal
+//! backslashes or physical source line numbers.
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use std::{ops::Deref, sync::LazyLock};
+
+use crate::shell::{self, ShellCommand};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceCommand {
@@ -27,10 +30,54 @@ pub struct SourceDiagnostic {
     pub text: String,
 }
 
+/// A validated source record and its single shell parse.
+///
+/// Source access is immutable, preventing a cached argv from outliving edits to
+/// its source spelling. To classify changed text, construct a `SourceCommand`
+/// and pass it to `Registry::classify`, which validates it afresh.
+#[derive(Clone, Debug)]
+pub struct ParsedCommand {
+    source: SourceCommand,
+    shell: Option<ShellCommand>,
+}
+
+impl ParsedCommand {
+    pub fn source(&self) -> &SourceCommand {
+        &self.source
+    }
+
+    pub fn shell(&self) -> Option<&ShellCommand> {
+        self.shell.as_ref()
+    }
+
+    pub(crate) fn into_parts(self) -> (SourceCommand, Option<ShellCommand>) {
+        (self.source, self.shell)
+    }
+}
+
+impl Deref for ParsedCommand {
+    type Target = SourceCommand;
+
+    fn deref(&self) -> &SourceCommand {
+        &self.source
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InputLog {
-    pub commands: Vec<SourceCommand>,
+    commands: Vec<ParsedCommand>,
     pub diagnostics: Vec<SourceDiagnostic>,
+}
+
+impl InputLog {
+    /// Validated records are immutable, so their parsed argv cannot become stale.
+    pub fn commands(&self) -> &[ParsedCommand] {
+        &self.commands
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<ParsedCommand>, Vec<SourceDiagnostic>) {
+        (self.commands, self.diagnostics)
+    }
 }
 
 static TRACE_UPDATE: LazyLock<Regex> =
@@ -102,11 +149,6 @@ pub fn read_log(text: &str) -> Result<InputLog> {
             );
         }
         let continued = active_continuation(line, &mut quote);
-        if continued && crlf {
-            bail!(
-                "CRLF shell continuation at source line {line_number} is not a Bash backslash-newline"
-            );
-        }
         let mut command = pending.take().unwrap_or_else(|| SourceCommand {
             line: line_number,
             text: String::new(),
@@ -121,9 +163,12 @@ pub fn read_log(text: &str) -> Result<InputLog> {
             pending = Some(command);
             continue;
         }
-        crate::shell::parse(&command.text)
+        let parsed = shell::parse(&command.text)
             .with_context(|| format!("invalid shell command at source line {}", command.line))?;
-        log.commands.push(command);
+        log.commands.push(ParsedCommand {
+            source: command,
+            shell: parsed,
+        });
         quote = Quote::Unquoted;
     }
     if let Some(command) = pending {
@@ -310,7 +355,6 @@ mod tests {
             "echo trailing\\",
             "echo trailing\\\n",
             "echo x \\\nMakefile:2: target 'next' does not exist\necho next\n",
-            "echo x \\\r\ny\r\n",
             "echo \0bad\n",
         ] {
             assert!(
@@ -335,19 +379,7 @@ mod tests {
         let log = read_log(text).unwrap();
         assert_eq!(log.commands[0].text, "tool 'C:\\work\\foo.c'");
         assert_eq!(log.commands[1].text, "tool C:\\work\\foo.c");
-        assert_eq!(
-            crate::shell::parse(&log.commands[0].text)
-                .unwrap()
-                .unwrap()
-                .args,
-            [r"C:\work\foo.c"]
-        );
-        assert_eq!(
-            crate::shell::parse(&log.commands[1].text)
-                .unwrap()
-                .unwrap()
-                .args,
-            ["C:workfoo.c"]
-        );
+        assert_eq!(log.commands()[0].shell().unwrap().args, [r"C:\work\foo.c"]);
+        assert_eq!(log.commands()[1].shell().unwrap().args, ["C:workfoo.c"]);
     }
 }

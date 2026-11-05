@@ -2,27 +2,33 @@
 //!
 //! tree-sitter-bash validates the complete syntax tree before any static argv is
 //! exposed. Only a single simple command with literal words is decoded using
-//! shell-words; expansions, assignments, lists, pipelines, and other valid Bash
-//! syntax remain opaque and must run as the original text through `bash -c`.
+//! shell-words. A sole `COMMAND || cd .` exposes that same static command with
+//! explicit fallback metadata; its original source is never rewritten. Other
+//! lists, expansions, assignments, pipelines, and valid complex Bash syntax
+//! remain opaque and must run as the original text through `bash -c`.
 //! This is deliberately Bash/POSIX quoting, even for Windows-looking paths:
 //! unquoted `C:\\tmp` loses its escaping backslash, whereas `'C:\\tmp'` preserves
 //! it. Backslashes are never converted to path separators. This does not parse
 //! cmd.exe or PowerShell logs, and does not emulate their quoting on Linux.
 //!
-//! At most one ordinary file redirection is represented. Multiple redirects,
-//! descriptor duplication/closure, special Bash device paths, and stderr append
-//! remain opaque, preserving descriptor ordering and file-opening side effects.
+//! At most one ordinary file redirection is represented, except independent
+//! stdout/stderr `/dev/null` sinks. Other multiple redirects, descriptor
+//! duplication/closure, special Bash device paths, and stderr append remain
+//! opaque, preserving descriptor ordering and file-opening side effects.
 //!
-//! Because tree-sitter's error-recovering grammar is more permissive than Bash,
-//! opaque programs additionally use `bash --noprofile --norc -n -c` for syntax-only
-//! validation, with BASH_ENV/ENV removed. This subprocess cost is restricted to
-//! fallback programs; static commands need no subprocess. A Bash-capable Unix
-//! host is required; Windows-looking arguments do not imply Windows execution.
+//! Parsing is entirely in-process, on every host: tree-sitter recovery trees and
+//! incomplete constructs are rejected before any argv is exposed. Syntax outside
+//! the grammar's supported coverage is conservatively rejected, never delegated
+//! to a shell during planning. Only opaque job execution requires Bash (such as
+//! Git Bash on Windows); static typed commands execute native argv directly.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tree_sitter::Node;
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+};
+use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShellCommand {
@@ -32,41 +38,47 @@ pub struct ShellCommand {
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,
     pub append_stdout: bool,
+    /// Original recipe is exactly this command followed by `|| cd .`.
+    /// Ordinary execution must preserve its shell-level status fallback.
+    #[serde(default)]
+    pub noop_fallback: bool,
 }
 
-/// Validate the entire command; return static argv only when no Bash semantics
-/// would be lost. `None` is an opaque, valid shell program, never a partial parse.
+thread_local! {
+    static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
+/// Validate the entire command, reusing the grammar setup on this thread.
+/// Return static argv only when no Bash semantics would be lost. `None` is an
+/// opaque, valid shell program, never a partial parse. This starts no processes.
 pub fn parse(text: &str) -> Result<Option<ShellCommand>> {
-    if !cfg!(unix) {
-        bail!(
-            "Bash command parsing/execution requires a Unix host; Windows shells are unsupported"
-        );
-    }
     if text.contains('\0') {
         bail!("shell command contains a NUL byte");
     }
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .context("loading Bash grammar")?;
-    let tree = parser.parse(text, None).context("parsing Bash command")?;
-    let root = tree.root_node();
-    // The grammar accepts a terminal escape as a word in some contexts. Bash
-    // instead needs more input; do not silently execute an incomplete log line.
     if dangling_escape(text) {
         bail!("incomplete Bash escape at end of command");
     }
-    if root.has_error() || has_missing(root) {
-        // A recovery tree may represent either malformed Bash or valid syntax
-        // outside the grammar's coverage. Never expose argv from such a tree.
-        validate_opaque(text)?;
-        return Ok(None);
-    }
-    let command = parse_static(root, text)?;
-    if command.is_none() {
-        validate_opaque(text)?;
-    }
-    Ok(command)
+    PARSER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_bash::LANGUAGE.into())
+                .context("loading Bash grammar")?;
+            *slot = Some(parser);
+        }
+        let tree = slot
+            .as_mut()
+            .expect("initialized Bash parser")
+            .parse(text, None)
+            .context("parsing Bash command")?;
+        let root = tree.root_node();
+        if root.has_error() {
+            bail!("malformed, incomplete, or unsupported Bash syntax");
+        }
+        validate_structure(root, text)?;
+        parse_static(root, text)
+    })
 }
 
 fn parse_static(root: Node<'_>, text: &str) -> Result<Option<ShellCommand>> {
@@ -96,17 +108,46 @@ fn parse_static(root: Node<'_>, text: &str) -> Result<Option<ShellCommand>> {
     if root.children(&mut cursor).any(|node| !node.is_named()) {
         return Ok(None);
     }
+    let (statement, noop_fallback) = if statements[0].kind() == "list" {
+        let list = statements[0];
+        // Do not flatten nested lists, pipelines, assignments, or quoted text.
+        if list.child_count() != 3
+            || list.named_child_count() != 2
+            || list.child(1).is_none_or(|operator| operator.kind() != "||")
+        {
+            return Ok(None);
+        }
+        let left = list.named_child(0).expect("left list command");
+        let right = list.named_child(1).expect("right list command");
+        let mut words = Vec::new();
+        let mut redirects = Vec::new();
+        if !collect_simple(right, &mut words, &mut redirects)
+            || !redirects.is_empty()
+            || words.len() != 2
+            || &text[words[0].byte_range()] != "cd"
+            || &text[words[1].byte_range()] != "."
+            || !complete_static_spelling(right, text)
+        {
+            return Ok(None);
+        }
+        (left, true)
+    } else {
+        (statements[0], false)
+    };
+    if !complete_static_spelling(statement, text) {
+        return Ok(None);
+    }
 
     let mut words = Vec::new();
     let mut redirects = Vec::new();
-    if !collect_simple(statements[0], &mut words, &mut redirects) || redirects.len() > 1 {
+    if !collect_simple(statement, &mut words, &mut redirects) || redirects.len() > 2 {
         return Ok(None);
     }
-    let mut words = words.into_iter();
+    let mut words = words.into_iter().peekable();
     let Some(program_word) = words.next() else {
         return Ok(None);
     };
-    let Some(program) = decode_static(program_word, text)? else {
+    let Some(program) = decode_command_word(program_word, &mut words, text)? else {
         return Ok(None);
     };
     if program.is_empty() {
@@ -140,8 +181,8 @@ fn parse_static(root: Node<'_>, text: &str) -> Result<Option<ShellCommand>> {
         return Ok(None);
     }
     let mut args = Vec::with_capacity(words.len());
-    for word in words {
-        let Some(decoded) = decode_static(word, text)? else {
+    while let Some(word) = words.next() {
+        let Some(decoded) = decode_command_word(word, &mut words, text)? else {
             return Ok(None);
         };
         args.push(decoded);
@@ -153,11 +194,20 @@ fn parse_static(root: Node<'_>, text: &str) -> Result<Option<ShellCommand>> {
         stdout: None,
         stderr: None,
         append_stdout: false,
+        noop_fallback,
     };
-    if let Some(redirect) = redirects.first() {
+    for redirect in &redirects {
         if !apply_redirect(*redirect, text, &mut command)? {
             return Ok(None);
         }
+    }
+    if redirects.len() == 2
+        && (command.stdin.is_some()
+            || command.stdout.as_deref() != Some(Path::new("/dev/null"))
+            || command.stderr.as_deref() != Some(Path::new("/dev/null"))
+            || command.append_stdout)
+    {
+        return Ok(None);
     }
     Ok(Some(command))
 }
@@ -190,30 +240,129 @@ fn separator_gap(text: &str) -> bool {
     true
 }
 
-fn validate_opaque(text: &str) -> Result<()> {
-    let output = std::process::Command::new("bash")
-        .args(["--noprofile", "--norc", "-n", "-c", text])
-        .env_remove("BASH_ENV")
-        .env_remove("ENV")
-        .output()
-        .context("checking opaque Bash syntax (bash must be installed)")?;
-    // Bash reports an unterminated here-document as a warning with exit zero.
-    // It is still an incomplete log record and must never be replayed.
-    if !output.status.success() || !output.stderr.is_empty() {
-        bail!(
-            "malformed or incomplete Bash command: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn has_missing(node: Node<'_>) -> bool {
+/// Cover grammar allowances that are not complete Bash statements. In
+/// particular, reserved closing words cannot be ordinary command names, empty
+/// compound bodies are invalid, and the scanner can synthesize a here-doc end
+/// at EOF. These checks inspect structure, not command execution or expansion.
+fn validate_structure(node: Node<'_>, text: &str) -> Result<()> {
     if node.is_missing() {
-        return true;
+        bail!("incomplete Bash syntax");
+    }
+    if matches!(node.kind(), ";;" | ";&" | ";;&")
+        && !node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "case_item")
+    {
+        bail!("unexpected Bash case terminator");
+    }
+    let spelling = &text[node.start_byte()..node.end_byte()];
+    if node.kind() == "command_name"
+        && matches!(
+            spelling,
+            "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "done"
+                | "do"
+                | "esac"
+                | "in"
+                | "if"
+                | "for"
+                | "select"
+                | "while"
+                | "until"
+                | "case"
+                | "function"
+                | "{"
+                | "}"
+        )
+    {
+        bail!("unexpected Bash reserved word {spelling}");
+    }
+    if node.kind() == "command" {
+        let mut cursor = node.walk();
+        let subshell = node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "subshell");
+        let name = node
+            .child_by_field_name("name")
+            .map(|name| &text[name.start_byte()..name.end_byte()]);
+        if subshell && !matches!(name, Some("time" | "coproc")) {
+            bail!("unexpected Bash subshell after command");
+        }
+        if name == Some("coproc") && node.named_child_count() == 1 {
+            bail!("incomplete Bash coprocess");
+        }
+    }
+    if matches!(node.kind(), "do_group" | "compound_statement")
+        && (node.kind() == "do_group" || spelling.starts_with('{'))
+    {
+        let mut cursor = node.walk();
+        if !node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() != "comment")
+        {
+            bail!("empty Bash compound body");
+        }
+    }
+    if matches!(node.kind(), "if_statement" | "elif_clause" | "else_clause") {
+        let mut cursor = node.walk();
+        let mut body = None;
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "then" | "else" => body = Some(false),
+                "fi" | "elif_clause" | "else_clause" => {
+                    if body == Some(false) {
+                        bail!("empty Bash conditional body");
+                    }
+                    body = None;
+                }
+                "comment" => {}
+                _ if child.is_named() && body.is_some() => body = Some(true),
+                _ => {}
+            }
+        }
+        if body == Some(false) {
+            bail!("empty Bash conditional body");
+        }
+    }
+    if node.kind() == "heredoc_redirect" {
+        let mut cursor = node.walk();
+        let start = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "heredoc_start")
+            .context("incomplete Bash here-document delimiter")?;
+        let mut cursor = node.walk();
+        let end = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "heredoc_end")
+            .context("incomplete Bash here-document")?;
+        let delimiter = shell_words::split(&text[start.start_byte()..start.end_byte()])
+            .context("unsupported Bash here-document delimiter")?;
+        let end_text = &text[end.start_byte()..end.end_byte()];
+        let suffix = &text[end.end_byte()..];
+        let line_start = text[..end.start_byte()]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let indent = &text[line_start..end.start_byte()];
+        let tabs_allowed = spelling.trim_start().starts_with("<<-")
+            || spelling
+                .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                .starts_with("<<-");
+        if delimiter.len() != 1
+            || delimiter[0] != end_text
+            || (!suffix.is_empty() && !suffix.starts_with('\n'))
+            || (!indent.is_empty() && !(tabs_allowed && indent.chars().all(|ch| ch == '\t')))
+        {
+            bail!("incomplete Bash here-document");
+        }
     }
     let mut cursor = node.walk();
-    node.children(&mut cursor).any(has_missing)
+    for child in node.children(&mut cursor) {
+        validate_structure(child, text)?;
+    }
+    Ok(())
 }
 
 fn collect_simple<'tree>(
@@ -279,11 +428,32 @@ fn static_shape(node: Node<'_>) -> bool {
     }
 }
 
+// The grammar emits separate word nodes across an unquoted escaped newline.
+// Bash removes that pair before tokenization: `se\\\ned` is one word, not two.
+fn decode_command_word<'tree>(
+    word: Node<'tree>,
+    following: &mut std::iter::Peekable<std::vec::IntoIter<Node<'tree>>>,
+    text: &str,
+) -> Result<Option<String>> {
+    let mut end = word.end_byte();
+    while let Some(next) = following.peek() {
+        let gap = &text[end..next.start_byte()];
+        if gap.is_empty() || !gap.split("\\\n").all(str::is_empty) {
+            break;
+        }
+        end = following.next().expect("peeked word").end_byte();
+    }
+    decode_spelling(&text[word.start_byte()..end])
+}
+
 fn decode_static(node: Node<'_>, text: &str) -> Result<Option<String>> {
     if !static_shape(node) {
         return Ok(None);
     }
-    let raw = &text[node.byte_range()];
+    decode_spelling(&text[node.byte_range()])
+}
+
+fn decode_spelling(raw: &str) -> Result<Option<String>> {
     if !literal_spelling(raw) {
         return Ok(None);
     }
@@ -578,8 +748,6 @@ mod tests {
             "case x in x) echo yes;; esac",
             "echo foo\r",
             "echo foo\u{b}bar",
-            "time { echo x; }",
-            "coproc NAME { echo x; }",
             "((x=1))",
         ] {
             assert!(

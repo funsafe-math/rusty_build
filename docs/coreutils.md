@@ -12,8 +12,11 @@ Examples of semantics that a native handler must not accidentally flatten are
 `cp` symlink handling, same-file checks, preservation and directory destinations;
 `mv` cross-filesystem moves and replacement; `rm` recursion and missing operands;
 `mkdir` modes/umask; and `touch` existing-file timestamps, no-create and references.
-A `std::fs` call is not a blanket GNU-compatible implementation. There is no claim
-that the accelerator's Bash execution path is supported on native Windows.
+A `std::fs` call is not a blanket GNU-compatible implementation. Windows command
+logs assume Bash is installed and use forward-slash paths; no cmd.exe/PowerShell
+quoting is emulated. Parsing is host-independent and in-process. Runtime
+verification remains on Linux; native Windows filesystem identity checks and
+coan batching remain conservative rather than claiming full GNU parity.
 
 ## Reusable upstream APIs
 

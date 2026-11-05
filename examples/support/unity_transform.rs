@@ -172,7 +172,7 @@ fn static_command(record: &JobRecord) -> bool {
     record
         .shell
         .as_ref()
-        .is_some_and(|s| s.stdin.is_none() && s.stdout.is_none() && s.stderr.is_none())
+        .is_some_and(|s| !rusty_make::job::requires_original_shell(Some(s)))
 }
 
 fn static_shell(argv: &[String]) -> Result<ShellCommand> {
@@ -187,6 +187,7 @@ fn static_shell(argv: &[String]) -> Result<ShellCommand> {
         stdout: None,
         stderr: None,
         append_stdout: false,
+        noop_fallback: false,
     })
 }
 

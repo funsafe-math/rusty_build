@@ -51,7 +51,7 @@ fn optimized_cli_matches_sequential_shell_reference() {
         copy_tree(&fixture, path);
     }
     let log = fs::read_to_string(fixture.join("commands.txt")).unwrap();
-    for command in rusty_make::input::read_log(&log).unwrap().commands {
+    for command in rusty_make::input::read_log(&log).unwrap().commands() {
         let status = Command::new("bash")
             .args(["--noprofile", "--norc", "-c", &command.text])
             .current_dir(&reference)

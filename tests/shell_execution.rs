@@ -111,3 +111,78 @@ fn persisted_redirected_compiler_executes_its_original_shell_command() {
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read(root.path().join("compiler.log")).unwrap(), b"");
 }
+
+#[test]
+fn persisted_null_streams_preserve_file_effects_and_need_no_shell() {
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path();
+    fs::write(p.join("seed"), b"null streams are not artifacts").unwrap();
+    let text = "cp seed copied > /dev/null 2> /dev/null\ncp copied final 2> /dev/null\n";
+    fs::write(p.join("commands.txt"), text).unwrap();
+    let registry = Registry::default();
+    let graph = parse_plan(text, p, &registry).unwrap();
+    for record in &graph.jobs {
+        assert!(
+            !record
+                .spec
+                .inputs
+                .iter()
+                .chain(&record.spec.outputs)
+                .any(|path| rusty_make::job::is_null_device(path))
+        );
+    }
+    let restored =
+        rusty_make::graph::BuildGraph::from_json(&serde_json::to_vec(&graph).unwrap(), &registry)
+            .unwrap();
+    run(&restored, &RunOptions::default()).unwrap();
+    assert_eq!(
+        fs::read(p.join("final")).unwrap(),
+        b"null streams are not artifacts"
+    );
+    fs::remove_file(p.join("copied")).unwrap();
+    fs::remove_file(p.join("final")).unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rusty_make"))
+        .current_dir(p)
+        .env("PATH", empty_path.path())
+        .args([
+            "--commands",
+            "commands.txt",
+            "--no-optimize",
+            "--rebuild-all",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(p.join("final")).unwrap(),
+        b"null streams are not artifacts"
+    );
+}
+
+#[test]
+fn ordinary_noop_fallback_retains_failure_masking_after_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let p = root.path();
+    fs::write(p.join("seed"), b"continue after masked failure").unwrap();
+    let registry = Registry::default();
+    let graph = parse_plan(
+        "cp missing absent 2> /dev/null || cd .\ncp seed final\n",
+        p,
+        &registry,
+    )
+    .unwrap();
+    let restored =
+        rusty_make::graph::BuildGraph::from_json(&serde_json::to_vec(&graph).unwrap(), &registry)
+            .unwrap();
+    run(&restored, &RunOptions::default()).unwrap();
+    assert!(!p.join("absent").exists());
+    assert_eq!(
+        fs::read(p.join("final")).unwrap(),
+        b"continue after masked failure"
+    );
+}

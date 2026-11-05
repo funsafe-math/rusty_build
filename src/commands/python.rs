@@ -1,12 +1,13 @@
 use std::path::Path;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::job::{ExecutionContext, Job};
 use crate::shell::ShellCommand;
 
-use super::external::execute_original;
+use super::external::{apply_null_streams, execute_original};
+use crate::job::requires_original_shell;
 
 /// A configured script identity, deliberately independent of interpreter spelling.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,14 +65,38 @@ impl Job for Python {
     }
 
     fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        execute_original(ctx)
+        if ctx.record.shell.is_none() || requires_original_shell(ctx.record.shell.as_ref()) {
+            return execute_original(ctx);
+        }
+        let mut command = std::process::Command::new(&self.interpreter);
+        command
+            .arg(&self.script)
+            .args(&self.args)
+            .current_dir(ctx.cwd);
+        apply_null_streams(&mut command, ctx.record.shell.as_ref());
+        let status = command
+            .status()
+            .with_context(|| format!("starting Python interpreter {}", self.interpreter))?;
+        if !status.success() {
+            bail!(
+                "Python command on line {} failed ({status}): {}",
+                ctx.record.source.line,
+                ctx.record.source.text
+            );
+        }
+        Ok(())
     }
 
     // Default batching preserves an independent process for every opaque script.
 }
 
 pub fn is_python(program: &str) -> bool {
-    let name = program.rsplit('/').next().unwrap_or(program);
+    let name = if cfg!(windows) {
+        program.rsplit(['/', '\\']).next().unwrap_or(program)
+    } else {
+        program.rsplit('/').next().unwrap_or(program)
+    };
+    let name = name.strip_suffix(".exe").unwrap_or(name);
     if name == "py" || name == "python" {
         return true;
     }

@@ -157,6 +157,7 @@ mod tests {
             stdout: None,
             stderr: None,
             append_stdout: false,
+            noop_fallback: false,
         }
     }
 

@@ -1,10 +1,10 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::job::{ExecutionContext, Job};
+use crate::job::{ExecutionContext, Job, is_null_device, requires_original_shell};
 use crate::shell::ShellCommand;
 
 /// An unmodeled command: its identity is known, but its filesystem effects are not.
@@ -90,7 +90,7 @@ pub fn execute_argv(argv: &[String], ctx: &ExecutionContext<'_>) -> Result<()> {
     let Some(shell) = ctx.record.shell.as_ref() else {
         return execute_original(ctx);
     };
-    if shell.stdin.is_some() || shell.stdout.is_some() || shell.stderr.is_some() {
+    if requires_original_shell(Some(shell)) {
         return execute_original(ctx);
     }
     let Some((program, args)) = argv.split_first() else {
@@ -99,16 +99,15 @@ pub fn execute_argv(argv: &[String], ctx: &ExecutionContext<'_>) -> Result<()> {
             ctx.record.source.line
         );
     };
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(ctx.cwd)
-        .status()
-        .with_context(|| {
-            format!(
-                "starting {program} for command on line {}",
-                ctx.record.source.line
-            )
-        })?;
+    let mut command = Command::new(program);
+    command.args(args).current_dir(ctx.cwd);
+    apply_null_streams(&mut command, Some(shell));
+    let status = command.status().with_context(|| {
+        format!(
+            "starting {program} for command on line {}",
+            ctx.record.source.line
+        )
+    })?;
     if !status.success() {
         bail!(
             "command on line {} failed ({status}): {}",
@@ -117,6 +116,33 @@ pub fn execute_argv(argv: &[String], ctx: &ExecutionContext<'_>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Honor portable null sinks without a Bash process or opening /dev/null as a
+/// literal Windows path. Meaningful file redirects still use the source shell.
+pub(crate) fn apply_null_streams(command: &mut Command, shell: Option<&ShellCommand>) {
+    let Some(shell) = shell else { return };
+    if shell
+        .stdin
+        .as_ref()
+        .is_some_and(|path| is_null_device(path))
+    {
+        command.stdin(Stdio::null());
+    }
+    if shell
+        .stdout
+        .as_ref()
+        .is_some_and(|path| is_null_device(path))
+    {
+        command.stdout(Stdio::null());
+    }
+    if shell
+        .stderr
+        .as_ref()
+        .is_some_and(|path| is_null_device(path))
+    {
+        command.stderr(Stdio::null());
+    }
 }
 
 #[cfg(test)]

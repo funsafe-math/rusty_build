@@ -191,11 +191,11 @@ mod tests {
             ".PHONY: all first second\nall: first second\nfirst:\n\t@touch first-result\nsecond:\n\t@touch second-result\n",
         );
         let log = plan(&["all".into()], dir.path()).unwrap();
-        assert_eq!(log.commands.len(), 2);
-        assert_eq!(log.commands[0].text, "touch first-result");
-        assert_eq!(log.commands[0].target.as_deref(), Some("first"));
-        assert_eq!(log.commands[1].text, "touch second-result");
-        assert_eq!(log.commands[1].target.as_deref(), Some("second"));
+        assert_eq!(log.commands().len(), 2);
+        assert_eq!(log.commands()[0].text, "touch first-result");
+        assert_eq!(log.commands()[0].target.as_deref(), Some("first"));
+        assert_eq!(log.commands()[1].text, "touch second-result");
+        assert_eq!(log.commands()[1].target.as_deref(), Some("second"));
         assert!(!dir.path().join("first-result").exists());
         assert!(!dir.path().join("second-result").exists());
     }
@@ -286,7 +286,7 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        assert_eq!(log.commands[0].text, "echo hello");
+        assert_eq!(log.commands()[0].text, "echo hello");
         assert!(!dir.path().join("unused").exists());
     }
 }

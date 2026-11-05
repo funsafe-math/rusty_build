@@ -2,7 +2,8 @@ use crate::job::{JobRecord, JobSnapshot};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsString,
     path::{Component, Path, PathBuf},
 };
 
@@ -60,6 +61,14 @@ struct StoredGraph {
 /// Resolve existing ancestors to expose aliases, then normalize missing suffixes.
 /// Backslash is not a path separator on POSIX.
 pub fn normalize(cwd: &Path, path: &Path) -> PathBuf {
+    normalize_with(cwd, path, |path| path.canonicalize().ok())
+}
+
+fn normalize_with(
+    cwd: &Path,
+    path: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
+) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -74,7 +83,7 @@ pub fn normalize(cwd: &Path, path: &Path) -> PathBuf {
             }
             c => {
                 resolved.push(c.as_os_str());
-                if let Ok(existing) = resolved.canonicalize() {
+                if let Some(existing) = canonicalize(&resolved) {
                     resolved = existing;
                 }
             }
@@ -82,8 +91,100 @@ pub fn normalize(cwd: &Path, path: &Path) -> PathBuf {
     }
     resolved
 }
-fn overlaps(a: &Path, b: &Path) -> bool {
-    a.starts_with(b) || b.starts_with(a)
+/// Filesystem observations belong to one rebuild, including failed lookups:
+/// independent outputs usually share most of their existing ancestors.
+#[derive(Default)]
+struct PathCache {
+    normalized: HashMap<PathBuf, PathBuf>,
+    canonical: HashMap<PathBuf, Option<PathBuf>>,
+    aliases: HashMap<PathBuf, bool>,
+}
+
+impl PathCache {
+    fn normalize(&mut self, cwd: &Path, path: &Path) -> PathBuf {
+        if let Some(normalized) = self.normalized.get(path) {
+            return normalized.clone();
+        }
+        let normalized = normalize_with(cwd, path, |prefix| {
+            if let Some(canonical) = self.canonical.get(prefix) {
+                return canonical.clone();
+            }
+            let canonical = prefix.canonicalize().ok();
+            self.canonical.insert(prefix.to_owned(), canonical.clone());
+            canonical
+        });
+        self.normalized.insert(path.to_owned(), normalized.clone());
+        normalized
+    }
+
+    fn aliased(&mut self, path: &Path) -> bool {
+        if let Some(&aliased) = self.aliases.get(path) {
+            return aliased;
+        }
+        let aliased = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        self.aliases.insert(path.to_owned(), aliased);
+        aliased
+    }
+}
+
+/// Exact-path users live at trie nodes. A query visits only its ancestors and
+/// descendants, never sibling paths, and collects jobs deterministically.
+#[derive(Default)]
+struct HazardIndex {
+    users: BTreeSet<usize>,
+    children: HashMap<OsString, HazardIndex>,
+}
+
+impl HazardIndex {
+    fn insert(&mut self, path: &Path, job: usize) {
+        let mut node = self;
+        for component in path.components() {
+            let key = component.as_os_str();
+            if !node.children.contains_key(key) {
+                node.children.insert(key.to_owned(), Self::default());
+            }
+            node = node.children.get_mut(key).expect("inserted hazard path");
+        }
+        node.users.insert(job);
+    }
+
+    fn overlapping(
+        &self,
+        path: &Path,
+        predecessors: &mut BTreeMap<usize, &'static str>,
+        reason: &'static str,
+    ) {
+        let mut node = self;
+        for component in path.components() {
+            for &job in &node.users {
+                predecessors.entry(job).or_insert(reason);
+            }
+            let Some(child) = node.children.get(component.as_os_str()) else {
+                return;
+            };
+            node = child;
+        }
+        node.collect(predecessors, reason);
+    }
+
+    fn collect(&self, predecessors: &mut BTreeMap<usize, &'static str>, reason: &'static str) {
+        for &job in &self.users {
+            predecessors.entry(job).or_insert(reason);
+        }
+        for child in self.children.values() {
+            child.collect(predecessors, reason);
+        }
+    }
 }
 
 impl BuildGraph {
@@ -151,12 +252,13 @@ impl BuildGraph {
             diagnostics: stored.diagnostics,
         };
         graph.rebuild()?;
+        let mut edge_pairs: BTreeSet<_> = graph
+            .edges
+            .iter()
+            .map(|edge| (edge.from, edge.to))
+            .collect();
         for edge in stored.edges {
-            if !graph
-                .edges
-                .iter()
-                .any(|existing| existing.from == edge.from && existing.to == edge.to)
-            {
+            if edge_pairs.insert((edge.from, edge.to)) {
                 graph.edges.push(edge);
             }
         }
@@ -171,6 +273,7 @@ impl BuildGraph {
         for job in &mut self.jobs {
             job.refine_effects(&self.cwd)?;
         }
+        let mut paths = PathCache::default();
         let mut versions = std::collections::BTreeMap::<PathBuf, u32>::new();
         let inputs: Vec<Vec<PathBuf>> = self
             .jobs
@@ -179,7 +282,7 @@ impl BuildGraph {
                 j.spec
                     .inputs
                     .iter()
-                    .map(|p| normalize(&self.cwd, p))
+                    .map(|p| paths.normalize(&self.cwd, p))
                     .collect()
             })
             .collect();
@@ -191,7 +294,7 @@ impl BuildGraph {
                     .spec
                     .outputs
                     .iter()
-                    .map(|p| normalize(&self.cwd, p))
+                    .map(|p| paths.normalize(&self.cwd, p))
                     .collect();
                 if j.spec.creates_parents {
                     // A job may create ancestors of its declared outputs.
@@ -221,7 +324,7 @@ impl BuildGraph {
                     dependency.consumer_line
                 );
             }
-            let artifact = normalize(&self.cwd, &dependency.artifact);
+            let artifact = paths.normalize(&self.cwd, &dependency.artifact);
             if !outputs[producer].contains(&artifact) {
                 bail!(
                     "required producer line {} does not declare output {}",
@@ -263,21 +366,22 @@ impl BuildGraph {
         let aliased: Vec<bool> = inputs
             .iter()
             .zip(&outputs)
-            .map(|(reads, writes)| {
-                reads.iter().chain(writes).any(|path| {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = path;
-                        false
-                    }
-                })
-            })
+            .map(|(reads, writes)| reads.iter().chain(writes).any(|path| paths.aliased(path)))
             .collect();
+        let barriers: Vec<bool> = self
+            .jobs
+            .iter()
+            .zip(&aliased)
+            .map(|(job, aliased)| job.spec.unknown_effects || *aliased)
+            .collect();
+        let mut writers = HazardIndex::default();
+        let mut readers = HazardIndex::default();
+        let mut frontier = BTreeSet::new();
+        let mut last_barrier = None;
+        let mut prior_barriers = Vec::new();
+        let hoisting = required_pairs
+            .iter()
+            .any(|&(producer, consumer)| producer > consumer);
         for i in 0..self.jobs.len() {
             self.reads.push(
                 inputs[i]
@@ -305,51 +409,86 @@ impl BuildGraph {
                     })
                     .collect(),
             );
-            for prior in 0..i {
-                // Required generated inputs intentionally read the generated
-                // final version, rather than an older file at this log position.
-                // Other data hazards are never overridden by a policy.
-                let reverse_prerequisite = required_pairs.contains(&(i, prior))
-                    && !self.jobs[i].spec.unknown_effects
-                    && !aliased[i]
-                    && !aliased[prior];
-                let reason = if outputs[prior]
-                    .iter()
-                    .any(|a| inputs[i].iter().any(|b| overlaps(a, b)))
-                {
-                    Some("read after write / directory prerequisite")
-                } else if outputs[prior]
-                    .iter()
-                    .any(|a| outputs[i].iter().any(|b| overlaps(a, b)))
-                {
-                    Some("write after write")
-                } else if inputs[prior]
-                    .iter()
-                    .filter(|path| {
-                        !final_reads
-                            .get(&prior)
-                            .is_some_and(|paths| paths.contains(*path))
-                    })
-                    .any(|a| outputs[i].iter().any(|b| overlaps(a, b)))
-                {
-                    Some("write after read")
-                } else if !reverse_prerequisite
-                    && (self.jobs[i].spec.unknown_effects
-                        || self.jobs[prior].spec.unknown_effects
-                        || aliased[i]
-                        || aliased[prior])
-                {
-                    Some("unknown-effect or filesystem-alias ordering barrier")
-                } else {
-                    None
+            let mut predecessors = BTreeMap::new();
+            // Retain every actual hazard (and the original reason precedence),
+            // even when its ordering is also implied by a barrier.
+            for path in &inputs[i] {
+                writers.overlapping(
+                    path,
+                    &mut predecessors,
+                    "read after write / directory prerequisite",
+                );
+            }
+            for path in &outputs[i] {
+                writers.overlapping(path, &mut predecessors, "write after write");
+            }
+            for path in &outputs[i] {
+                readers.overlapping(path, &mut predecessors, "write after read");
+            }
+            const BARRIER: &str = "unknown-effect or filesystem-alias ordering barrier";
+            if hoisting {
+                // A backward explicit requirement can remove one particular
+                // consumer->producer barrier, but must not remove intervening
+                // paths that reveal an unsafe hoist as a cycle. Keep the exact
+                // barrier relation for this policy-only case. Path hazards are
+                // still indexed; ordinary plans use the linear frontier below.
+                let mut add_barrier = |prior| {
+                    let reverse_prerequisite =
+                        required_pairs.contains(&(i, prior)) && !barriers[i] && !aliased[prior];
+                    if !reverse_prerequisite {
+                        predecessors.entry(prior).or_insert(BARRIER);
+                    }
                 };
-                if let Some(reason) = reason {
-                    self.edges.push(Edge {
-                        from: prior,
-                        to: i,
-                        reason: reason.into(),
-                    });
+                if barriers[i] {
+                    for prior in 0..i {
+                        add_barrier(prior);
+                    }
+                } else {
+                    for &prior in &prior_barriers {
+                        add_barrier(prior);
+                    }
                 }
+            } else if barriers[i] {
+                // All earlier nodes reach a current sink. Joining those sinks
+                // orders the entire prefix without a dense all-pairs barrier.
+                for &prior in &frontier {
+                    predecessors.entry(prior).or_insert(BARRIER);
+                }
+            } else if let Some(prior) = last_barrier {
+                predecessors.entry(prior).or_insert(BARRIER);
+            }
+            for (prior, reason) in predecessors {
+                if !hoisting {
+                    frontier.remove(&prior);
+                }
+                self.edges.push(Edge {
+                    from: prior,
+                    to: i,
+                    reason: reason.into(),
+                });
+            }
+            if !hoisting {
+                frontier.insert(i);
+            }
+            if barriers[i] {
+                if hoisting {
+                    prior_barriers.push(i);
+                } else {
+                    last_barrier = Some(i);
+                }
+            }
+            // Final-artifact policy reads deliberately do not cause a WAR at
+            // their original log position; all other reads do.
+            for path in &inputs[i] {
+                if !final_reads
+                    .get(&i)
+                    .is_some_and(|paths| paths.contains(path))
+                {
+                    readers.insert(path, i);
+                }
+            }
+            for path in &outputs[i] {
+                writers.insert(path, i);
             }
         }
         for (producer, consumer, index) in required {

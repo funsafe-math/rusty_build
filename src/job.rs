@@ -146,7 +146,7 @@ impl JobRecord {
         if snapshot.spec.kind != command.kind() {
             bail!("job kind is inconsistent with typed payload {}", T::TYPE);
         }
-        let redirected = has_redirects(snapshot.shell.as_ref());
+        let redirected = requires_original_shell(snapshot.shell.as_ref());
         let replaces_effects = redirected
             && (command.strategy() != ExecutionStrategy::External || command.unknown_effects());
         let expected_strategy = if redirected {
@@ -191,11 +191,13 @@ impl JobRecord {
                 .stdin
                 .iter()
                 .chain(shell.stdout.iter().filter(|_| shell.append_stdout))
+                .filter(|path| !is_null_device(path))
                 .any(|path| !snapshot.spec.inputs.contains(path))
                 || shell
                     .stdout
                     .iter()
                     .chain(shell.stderr.iter())
+                    .filter(|path| !is_null_device(path))
                     .any(|path| !snapshot.spec.outputs.contains(path))
             {
                 bail!("snapshot omits shell redirection effects for {}", T::TYPE);
@@ -213,7 +215,7 @@ impl JobRecord {
         let Some(shell) = &self.shell else {
             return;
         };
-        if !has_redirects(Some(shell)) {
+        if !requires_original_shell(Some(shell)) {
             return;
         }
         let precise_external =
@@ -225,16 +227,16 @@ impl JobRecord {
             self.spec.unknown_effects = true;
             self.spec.creates_parents = false;
         }
-        if let Some(path) = &shell.stdin {
+        if let Some(path) = shell.stdin.as_ref().filter(|path| !is_null_device(path)) {
             self.spec.inputs.push(path.clone());
         }
-        if let Some(path) = &shell.stdout {
+        if let Some(path) = shell.stdout.as_ref().filter(|path| !is_null_device(path)) {
             self.spec.outputs.push(path.clone());
             if shell.append_stdout {
                 self.spec.inputs.push(path.clone());
             }
         }
-        if let Some(path) = &shell.stderr {
+        if let Some(path) = shell.stderr.as_ref().filter(|path| !is_null_device(path)) {
             self.spec.outputs.push(path.clone());
         }
         self.spec.cacheable = false;
@@ -243,6 +245,33 @@ impl JobRecord {
 
 pub fn has_redirects(shell: Option<&ShellCommand>) -> bool {
     shell.is_some_and(|s| s.stdin.is_some() || s.stdout.is_some() || s.stderr.is_some())
+}
+
+/// Shell null streams are not filesystem artifacts. A POSIX file named NUL
+/// remains an ordinary file; only Windows reserves that device name.
+pub fn is_null_device(path: &Path) -> bool {
+    path == Path::new("/dev/null")
+        || (cfg!(windows)
+            && path.to_str().is_some_and(|name| {
+                name.eq_ignore_ascii_case("NUL") || name.eq_ignore_ascii_case("NUL:")
+            }))
+}
+
+pub fn has_file_redirects(shell: Option<&ShellCommand>) -> bool {
+    shell.is_some_and(|shell| {
+        shell
+            .stdin
+            .iter()
+            .chain(&shell.stdout)
+            .chain(&shell.stderr)
+            .any(|path| !is_null_device(path))
+    })
+}
+
+/// Null-only streams can be applied directly to typed argv. File redirects
+/// and the ordinary command's failure-masking fallback retain Bash semantics.
+pub fn requires_original_shell(shell: Option<&ShellCommand>) -> bool {
+    has_file_redirects(shell) || shell.is_some_and(|shell| shell.noop_fallback)
 }
 
 pub struct ExecutionContext<'a> {
