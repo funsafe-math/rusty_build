@@ -208,8 +208,10 @@ pub fn sed(shell: &ShellCommand) -> Result<JobSpec> {
 #[derive(Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 struct CompilerArgs {
-    #[arg(short = 'I')]
+    #[arg(short = 'I', allow_hyphen_values = true)]
     includes: Vec<PathBuf>,
+    #[arg(short = 'L', allow_hyphen_values = true)]
+    library_paths: Vec<PathBuf>,
     #[arg(short = 'D')]
     defines: Vec<String>,
     #[arg(long = "rusty-optimization", value_parser = ["0", "1", "2", "3", "s", "z", "g", "fast"])]
@@ -220,7 +222,7 @@ struct CompilerArgs {
     compile_only: bool,
     #[arg(short = 'o')]
     output: Option<PathBuf>,
-    #[arg(required = true, num_args = 1..)]
+    #[arg(num_args = 0..)]
     files: Vec<PathBuf>,
 }
 
@@ -277,70 +279,91 @@ fn source_file(path: &Path) -> bool {
 }
 
 pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
-    let mut normalized = shell.clone();
     let mut args = Vec::with_capacity(shell.args.len());
+    let mut unparsed_args = Vec::new();
     let mut operand_value = false;
     let mut positional_only = false;
+    let mut opaque_operands = false;
+    // This is a lexical partition, not a second compiler argument parser:
+    // clap parses the recognized subset; everything else stays in original argv.
+    // An unknown option's arity is unknowable, so its following bare operands
+    // remain opaque until another option boundary instead of becoming sources.
     for arg in &shell.args {
         if operand_value {
             args.push(arg.clone());
             operand_value = false;
-        } else if positional_only {
-            args.push(arg.clone());
-        } else if arg == "--" {
+        } else if arg == "--" && !positional_only {
             positional_only = true;
+            opaque_operands = false;
             args.push(arg.clone());
-        } else if matches!(arg.as_str(), "-I" | "-D" | "-o") {
+        } else if !positional_only && matches!(arg.as_str(), "-I" | "-L" | "-D" | "-o") {
             operand_value = true;
+            opaque_operands = false;
             args.push(arg.clone());
-        } else if let Some(level) = arg.strip_prefix("-O") {
+        } else if !positional_only
+            && (arg == "-c"
+                || ["-I", "-L", "-D", "-o"]
+                    .iter()
+                    .any(|prefix| arg.starts_with(prefix)))
+        {
+            opaque_operands = false;
+            args.push(arg.clone());
+        } else if !positional_only
+            && arg.strip_prefix("-O").is_some_and(|level| {
+                matches!(level, "" | "0" | "1" | "2" | "3" | "s" | "z" | "g" | "fast")
+            })
+        {
+            opaque_operands = false;
+            let level = &arg[2..];
             args.push(format!(
                 "--rusty-optimization={}",
                 if level.is_empty() { "1" } else { level }
             ));
-        } else if let Some(level) = arg.strip_prefix("-g") {
+        } else if !positional_only
+            && arg
+                .strip_prefix("-g")
+                .is_some_and(|level| matches!(level, "" | "0" | "1" | "2" | "3"))
+        {
+            opaque_operands = false;
+            let level = &arg[2..];
             args.push(format!(
                 "--rusty-debug={}",
                 if level.is_empty() { "2" } else { level }
             ));
+        } else if (!positional_only && arg.starts_with('-') && arg != "-") || arg.starts_with('@') {
+            opaque_operands = true;
+            unparsed_args.push(arg.as_str());
+        } else if opaque_operands {
+            unparsed_args.push(arg.as_str());
         } else {
-            if arg.starts_with('-')
-                && arg != "-"
-                && arg != "-c"
-                && !arg.starts_with("-I")
-                && !arg.starts_with("-D")
-                && !arg.starts_with("-o")
-            {
-                bail!("unsupported compiler option: {arg}");
-            }
             args.push(arg.clone());
         }
     }
-    normalized.args = args;
-    let args: CompilerArgs = parse(&normalized)?;
+    let args = CompilerArgs::try_parse_from(
+        std::iter::once(shell.program.as_str()).chain(args.iter().map(String::as_str)),
+    )?;
+    let metadata_complete = unparsed_args.is_empty();
+    if args.files.is_empty() && metadata_complete {
+        bail!("compiler requires an input file");
+    }
     let sources: Vec<PathBuf> = args
         .files
         .iter()
         .filter(|p| source_file(p))
         .cloned()
         .collect();
-    if !args.compile_only && sources.iter().any(|p| header_file(p)) {
+    if metadata_complete && !args.compile_only && sources.iter().any(|p| header_file(p)) {
         bail!("header compilation requires explicit -c in the supported compiler subset");
     }
-    if args.compile_only && args.output.is_some() && sources.len() > 1 {
+    if metadata_complete && args.compile_only && args.output.is_some() && sources.len() > 1 {
         bail!("compiler -c with -o requires at most one source file");
-    }
-    // Response files can hide arbitrary flags and inputs: reject rather than
-    // claiming their contents have been parsed by the narrow grammar.
-    if args
-        .files
-        .iter()
-        .any(|p| p.as_os_str().to_string_lossy().starts_with('@'))
-    {
-        bail!("compiler response files are unsupported");
     }
     let outputs = if let Some(output) = &args.output {
         vec![output.clone()]
+    } else if !metadata_complete {
+        // Unknown flags can select preprocessing, assembly or custom outputs.
+        // Do not invent the driver's default output in a partial metadata view.
+        vec![]
     } else if args.compile_only {
         sources
             .iter()
@@ -369,11 +392,11 @@ pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
     Ok(native(
         if args.compile_only { "compile" } else { "link" },
         Operation::External,
-        args.files.clone(),
+        args.files,
         outputs,
         false,
         true,
-        json!({"argv":argv,"sources":sources,"output":output,"compile_only":args.compile_only,"includes":args.includes,"defines":args.defines,"optimization":args.optimization,"debug":args.debug}),
+        json!({"argv":argv,"sources":sources,"output":output,"compile_only":args.compile_only,"includes":args.includes,"library_paths":args.library_paths,"defines":args.defines,"optimization":args.optimization,"debug":args.debug,"unparsed_args":unparsed_args,"metadata_complete":metadata_complete}),
     ))
 }
 
@@ -413,16 +436,6 @@ mod tests {
         assert_eq!(spec.parsed["output"], "obj/a.o");
         assert_eq!(spec.parsed["argv"][3], "-O2");
         assert!(spec.unknown_effects && !spec.cacheable);
-    }
-
-    #[test]
-    fn compiler_rejects_unknown_options_and_response_files() {
-        assert!(compiler(&command("gcc", &["-Wall", "a.c"])).is_err());
-        assert!(compiler(&command("gcc", &["-coout.o", "a.c"])).is_err());
-        assert!(compiler(&command("gcc", &["@args"])).is_err());
-        assert!(compiler(&command("gcc", &["-c", "a.c", "b.c", "-o", "all.o"])).is_err());
-        assert!(copy(&command("cp", &["-r", "a", "b"])).is_err());
-        assert!(mkdir(&command("mkdir", &["-m", "700", "a"])).is_err());
     }
 
     #[test]

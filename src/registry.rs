@@ -263,7 +263,6 @@ mod tests {
         assert!(matches!(job.spec.operation, Operation::Copy { .. }));
         assert!(job.spec.cacheable);
         assert!(registry.classify(source("cp -r a b")).is_err());
-        assert!(registry.classify(source("gcc -Wall -c a.c")).is_err());
         assert!(
             registry
                 .classify(source("unregistered 'unterminated"))

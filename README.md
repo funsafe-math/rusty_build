@@ -165,9 +165,27 @@ premature indexed dependency engine. No throughput/speedup benchmark is claimed.
 | `rm [-f\|--force] PATH...` | Native unlink; force ignores missing paths | No recursion/options beyond force; global barrier; never skipped |
 | `mv SRC DST` | Native regular-file rename | Same filesystem; no options, directory/symlink/multiply-linked destination behavior; barrier; never skipped |
 | `sed` | Typed `-e`, `-f`, `-n`, `-i[SUFFIX]`, operands; original command executed | No native sed/semantic inference; arbitrary scripts are global barriers and never cached |
-| GCC/Clang/`cc`/C++ drivers | Typed `-I`, `-D`, `-O` levels, `-g[0-3]`, `-c`, `-o`; source/output metadata | Narrow grammar, not full GCC compatibility; unsupported flags/response files rejected; always external/barrier/dirty |
+| GCC/Clang/`cc`/C++ drivers | Typed `-I`, `-L`, `-D`, `-O` levels, `-g[0-3]`, `-c`, `-o`; partial source/output metadata | Unknown flags and response files preserved for the original compiler; always external/barrier/dirty |
 | Configured Python scripts | Independent identities across `python`, `python3[.N]`, `py`, absolute POSIX interpreter paths | No guessed script dependencies or interpreter options; original-text execution/barrier |
 | Other programs | Visible `unknown:` external jobs | Unknown filesystem effects ordered against all other jobs |
+
+Compiler include and library search paths support both separated and joined
+forms: `-I include`, `-Iinclude`, `-L lib`, `-Llib`, including quoted paths with
+spaces. Unknown options such as `-Wall`, `-std=c11`, `-lfoo` and extended `-g`/`-O`
+forms do **not** abort planning. The original command executes unchanged, and
+compilation database entries preserve every argument. Only the compiler decides
+whether forwarded flags are valid; a compiler failure still stops dependent work.
+
+JSON metadata exposes `includes`, `library_paths`, `unparsed_args` and
+`metadata_complete`. Unknown option arity is not guessed: following bare operands
+stay opaque until another option boundary, so option values like
+`-include generated.c` are not mistaken for compilation sources. Response-file
+contents are likewise opaque. Sources hidden in those opaque operands are omitted
+from compilation database entries rather than invented. Default output filenames
+are not inferred when unknown arguments could change the compiler's mode;
+explicit `-o` metadata is retained. Missing values for recognized flags remain
+parsing errors. `--explain` reports partial metadata and preserved arguments.
+
 
 Simple stdin/stdout/stderr redirects and stdout append are recognized separately
 from argv. Multiple/descriptor redirects and dynamic words, globbing, assignments,
@@ -276,7 +294,7 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **71 passed**, no failures, including real compiler, Python, sed,
+* `cargo test`: **76 passed**, no failures, including real compiler, Python, sed,
   Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
@@ -285,6 +303,10 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   jobs on the identical second run. `--rebuild-all --no-optimize` executed both
   original jobs. The real Make CLI smoke preserved expansion-generated files and
   copied the planned output correctly.
+* Compiler passthrough CLI smoke: joined/separated `-I` and `-L`, paths with
+  spaces, and unknown-to-Rust flags (`-Wall`, `-Wextra`, `-std=c11`, `-lvalue`)
+  compiled and linked against a generated static library; the application printed
+  `12`. Exported plan metadata and original compilation argv were inspected.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings

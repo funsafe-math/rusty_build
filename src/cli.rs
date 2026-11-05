@@ -118,6 +118,18 @@ impl Cli {
                     "[CLASSIFY] node {id} line {}: {} {:?} target={:?}",
                     job.source.line, job.spec.kind, job.strategy, job.source.target
                 );
+                if let Some(unparsed) = job
+                    .spec
+                    .parsed
+                    .get("unparsed_args")
+                    .and_then(|v| v.as_array())
+                    && !unparsed.is_empty()
+                {
+                    eprintln!(
+                        "[COMPILER] node {id}: metadata partial; preserving unparsed arguments {}",
+                        job.spec.parsed["unparsed_args"]
+                    );
+                }
             }
             for edge in &graph.edges {
                 eprintln!("[GRAPH] {} -> {}: {}", edge.from, edge.to, edge.reason);
