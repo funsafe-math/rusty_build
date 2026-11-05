@@ -19,6 +19,18 @@ cargo run -- --commands commands.txt --compile-commands compile_commands.json
 cargo run -- --commands commands.txt --rebuild-all --no-optimize
 ```
 
+To cross-build a Windows executable on Debian/Ubuntu and run it with Wine:
+
+```sh
+sudo apt-get install gcc-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+cargo build --target x86_64-pc-windows-gnu
+wine target/x86_64-pc-windows-gnu/debug/rusty_make.exe --commands commands.txt --verbose
+```
+
+This uses the Linux Rust compiler with Windows target support; no separate
+Windows-hosted compiler is needed. Opaque recipes still require Windows Bash.
+
 Commands run relative to the **current working directory**, not the log's parent.
 Do not replay untrusted logs: external commands have your process permissions.
 The whole input is validated and classified before any job executes. A malformed
@@ -362,6 +374,12 @@ Windows filesystem identity support remains conservative: native copy/move over
 existing destinations can be rejected when safe link identity is unavailable.
 Coan precision/batching is disabled on non-Unix hosts; external execution remains.
 
+Execution cwd uses ordinary Windows drive/UNC paths, not the verbatim prefix
+introduced by `canonicalize()`. Filesystem identity comparisons may canonicalize
+paths internally, but do not replace execution cwd. Older saved plans with
+verbatim drive/UNC roots are restored using ordinary typed path prefixes, without
+replacing arbitrary characters in recipe arguments.
+
 Compiler include and library search paths support both separated and joined
 forms: `-I include`, `-Iinclude`, `-L lib`, `-Llib`, including quoted paths with
 spaces. `-isystem`, `-iquote` and `-idirafter` paths are also extracted (separate or
@@ -682,7 +700,7 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **270 passed** across 23 suites, no failures, including real coan,
+* `cargo test`: **271 passed** across 23 suites, no failures, including real coan,
   gawk, compiler, Python, sed, Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
@@ -737,8 +755,11 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   both coan files became `kept`, and original physical source lines were retained.
 * Windows compilation-database export smoke: a verbatim native directory exported
   as `C:/work/project`; executable/source/output paths retained forward slashes
-  while a regex-valued define kept its meaningful backslash. No Windows binary
-  was executed on this host.
+  while a regex-valued define kept its meaningful backslash.
+* Windows cwd regression: cross-compiled for `x86_64-pc-windows-gnu` and executed
+  under Wine 9.0. A real CLI run created nested directories, copied and touched
+  files using forward-slash operands. The regression also executed from a cwd
+  containing spaces/non-ASCII characters and restored an older verbatim-root plan.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings

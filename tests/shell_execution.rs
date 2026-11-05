@@ -186,3 +186,47 @@ fn ordinary_noop_fallback_retains_failure_masking_after_restore() {
         b"continue after masked failure"
     );
 }
+
+#[test]
+fn execution_cwd_supports_forward_slash_operands_and_legacy_plan_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("working tree é");
+    fs::create_dir(&cwd).unwrap();
+    fs::write(cwd.join("input.txt"), b"cwd payload").unwrap();
+    #[cfg(windows)]
+    let supplied_cwd = std::path::PathBuf::from(cwd.to_string_lossy().replace('\\', "/"));
+    #[cfg(not(windows))]
+    let supplied_cwd = cwd.clone();
+    let registry = Registry::default();
+    let graph = parse_plan(
+        "mkdir -p 'build tree/objects'\ncp input.txt 'build tree/objects/output.txt'\n\
+         touch 'build tree/objects/stamp'\n",
+        &supplied_cwd,
+        &registry,
+    )
+    .unwrap();
+    let options = RunOptions {
+        rebuild_all: true,
+        ..Default::default()
+    };
+    run(&graph, &options).unwrap();
+    assert_eq!(
+        fs::read(cwd.join("build tree/objects/output.txt")).unwrap(),
+        b"cwd payload"
+    );
+    assert!(cwd.join("build tree/objects/stamp").is_file());
+
+    // Simulate an older plan's canonicalized cwd, including \\?\ on Windows.
+    let mut stored = serde_json::to_value(&graph).unwrap();
+    stored["cwd"] = serde_json::to_value(cwd.canonicalize().unwrap()).unwrap();
+    let restored =
+        rusty_make::graph::BuildGraph::from_json(&serde_json::to_vec(&stored).unwrap(), &registry)
+            .unwrap();
+    fs::remove_file(cwd.join("build tree/objects/output.txt")).unwrap();
+    fs::remove_file(cwd.join("build tree/objects/stamp")).unwrap();
+    run(&restored, &options).unwrap();
+    assert_eq!(
+        fs::read(cwd.join("build tree/objects/output.txt")).unwrap(),
+        b"cwd payload"
+    );
+}

@@ -187,11 +187,48 @@ impl HazardIndex {
     }
 }
 
+/// Execution paths must accept ordinary forward-slash recipe operands.
+/// Windows canonicalize produces a verbatim prefix with different join rules;
+/// reserve canonicalization for hazard identities, not the execution cwd.
+fn execution_cwd(cwd: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        let absolute = std::path::absolute(cwd).context("resolve build working directory")?;
+        if !absolute
+            .metadata()
+            .context("inspect build working directory")?
+            .is_dir()
+        {
+            bail!(
+                "build working directory is not a directory: {}",
+                absolute.display()
+            );
+        }
+        let mut components = absolute.components();
+        // Older saved plans already contain canonicalize's verbatim spelling.
+        // Convert only those typed prefixes, never arbitrary path characters.
+        let mut ordinary = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+                Prefix::VerbatimUNC(server, share) => Path::new(r"\\").join(server).join(share),
+                _ => return Ok(absolute),
+            },
+            _ => return Ok(absolute),
+        };
+        ordinary.extend(components);
+        Ok(ordinary)
+    }
+    #[cfg(not(windows))]
+    {
+        cwd.canonicalize()
+            .context("resolve build working directory")
+    }
+}
+
 impl BuildGraph {
     pub fn new(jobs: Vec<JobRecord>, cwd: &Path) -> Result<Self> {
-        let cwd = cwd
-            .canonicalize()
-            .context("resolve build working directory")?;
+        let cwd = execution_cwd(cwd)?;
         let mut graph = Self {
             provenance: jobs.iter().cloned().map(|j| vec![j]).collect(),
             jobs,
@@ -239,10 +276,7 @@ impl BuildGraph {
         let mut graph = Self {
             jobs,
             provenance,
-            cwd: stored
-                .cwd
-                .canonicalize()
-                .context("resolve stored build directory")?,
+            cwd: execution_cwd(&stored.cwd)?,
             edges: vec![],
             required_dependencies: stored.required_dependencies,
             waves: vec![],
