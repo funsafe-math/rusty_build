@@ -1,11 +1,11 @@
 //! An explicitly opted-in, conservative C unity transform, not a CLI default.
 //!
-//! Group names are the source basename before its first underscore (the whole
-//! stem when there is no underscore). Callers must opt in only sources suitable
-//! for unity: file-local identifiers, macros, pragmas, and `__FILE__` semantics
-//! can change when translation units are combined. This example does not prove
-//! source-level compatibility. It does prove the command/consumer constraints
-//! below before replacing the graph, and never writes files while planning.
+//! Graph-compatible classes are discovered before a caller's optional grouping
+//! policy subdivides them. The default policy uses the source basename prefix
+//! before its first underscore. Callers must opt in only sources suitable for
+//! unity: file-local identifiers, macros, pragmas, and `__FILE__` semantics can
+//! change when translation units are combined. This example proves command and
+//! consumer compatibility, not source compatibility, and planning writes no files.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -14,10 +14,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use rusty_make::{
-    commands::compiler::Compiler,
-    graph::{BuildGraph, normalize},
+    commands::{ar::Ar, compiler::Compiler, external::execute_argv},
+    graph::{BuildGraph, Edge, normalize},
     input::SourceCommand,
-    job::{ExecutionContext, ExecutionStrategy, Job, JobRecord},
+    job::{ExecutionContext, ExecutionStrategy, Job, JobRecord, JobSpec},
     shell::ShellCommand,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,81 @@ impl Job for UnitySource {
     // independent generated TUs need no special multi-item execution protocol.
 }
 
+/// An archive update with explicit removal of the object members it supersedes.
+/// Register this type alongside `UnitySource` when restoring a transformed graph.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnityArchive {
+    // Flattening keeps Ar's binary-effect guards applicable to this job's spec.
+    #[serde(flatten)]
+    pub archive: Ar,
+    pub stale_members: Vec<String>,
+}
+impl Job for UnityArchive {
+    const TYPE: &'static str = "example.unity-archive";
+    fn parse(_: &ShellCommand) -> Result<Self> {
+        bail!("unity archives are created by the opt-in graph transform, not parsed")
+    }
+    fn inputs(&self) -> impl Iterator<Item = &Path> {
+        self.archive.inputs()
+    }
+    fn outputs(&self) -> impl Iterator<Item = &Path> {
+        self.archive.outputs()
+    }
+    fn unknown_effects(&self) -> bool {
+        self.archive.unknown_effects()
+    }
+    fn refine_effects(&self, spec: &mut JobSpec, cwd: &Path) -> Result<()> {
+        self.archive.refine_effects(spec, cwd)
+    }
+    fn validate(&self, record: &JobRecord, cwd: &Path) -> Result<()> {
+        ensure!(
+            !record.spec.unknown_effects,
+            "unity archive requires precise file effects; re-plan after archive format or alias changes"
+        );
+        ensure!(
+            static_command(record),
+            "unity archive requires static shell metadata"
+        );
+        archive_operands(&self.archive)?;
+        ensure!(
+            !self.stale_members.is_empty()
+                && self.stale_members.iter().all(|name| safe_member_name(name))
+                && self.stale_members.iter().collect::<BTreeSet<_>>().len()
+                    == self.stale_members.len(),
+            "unity archive requires unique, safe stale member basenames"
+        );
+        ensure!(
+            !self.archive.data.argv[3..].iter().any(|arg| {
+                Path::new(arg)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| self.stale_members.iter().any(|stale| stale == name))
+            }),
+            "unity archive would remove a member still present in its update"
+        );
+        self.archive.validate(record, cwd)
+    }
+    fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        // Validation guarantees static shell metadata, so the shared executor
+        // uses each modified argv rather than the original provenance command.
+        let archive = Path::new(&self.archive.data.argv[2]);
+        match fs::metadata(ctx.absolute(archive)) {
+            Ok(_) => {
+                let mut remove = vec![
+                    self.archive.data.argv[0].clone(),
+                    "d".into(),
+                    self.archive.data.argv[2].clone(),
+                ];
+                remove.extend(self.stale_members.iter().cloned());
+                execute_argv(&remove, ctx)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error).context("checking existing unity archive"),
+        }
+        self.archive.execute(ctx)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnityStats {
     pub groups: usize,
@@ -98,6 +173,171 @@ fn static_command(record: &JobRecord) -> bool {
         .shell
         .as_ref()
         .is_some_and(|s| s.stdin.is_none() && s.stdout.is_none() && s.stderr.is_none())
+}
+
+fn static_shell(argv: &[String]) -> Result<ShellCommand> {
+    let (program, args) = argv
+        .split_first()
+        .context("unity command has no executable")?;
+    ensure!(!program.is_empty(), "unity command has no executable");
+    Ok(ShellCommand {
+        program: program.clone(),
+        args: args.to_vec(),
+        stdin: None,
+        stdout: None,
+        stderr: None,
+        append_stdout: false,
+    })
+}
+
+fn safe_member_name(name: &str) -> bool {
+    !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.starts_with(['-', '@'])
+        && !name.contains(['/', '\\', '\0', '\n', '\r'])
+}
+
+fn archive_operands(archive: &Ar) -> Result<std::ops::Range<usize>> {
+    let argv = &archive.data.argv;
+    ensure!(
+        !archive.unknown_effects() && argv.len() >= 4,
+        "unity requires precise traditional ar r with c/s/D modifiers"
+    );
+    // Reuse the typed parser, including its response/plugin/script rejection.
+    let parsed = Ar::parse(&static_shell(argv)?)?;
+    ensure!(
+        !parsed.unknown_effects()
+            && parsed.data.inputs == archive.data.inputs
+            && parsed.data.outputs == archive.data.outputs,
+        "unity archive argv and typed effects disagree"
+    );
+    // Member ambiguity is checked per object during planning. Unrelated members
+    // need not prevent safe objects in the same archive from being combined.
+    let arg = &argv[2];
+    ensure!(
+        !arg.starts_with(['-', '@']) && !arg.contains(['\0', '\n', '\r', '\\']),
+        "unity archive has an unsafe archive filename"
+    );
+    let basename = Path::new(arg)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("unity archive requires a UTF-8 basename")?;
+    ensure!(
+        safe_member_name(basename),
+        "unity archive has an unsafe basename"
+    );
+    Ok(3..argv.len())
+}
+
+fn consumer_arguments(record: &JobRecord) -> Result<(&[String], Vec<usize>)> {
+    ensure!(
+        static_command(record),
+        "unity consumers require static commands without redirection"
+    );
+    if let Some(link) = record.typed::<Compiler>() {
+        ensure!(
+            link.metadata_complete
+                && !link.compile_only
+                && link.sources.is_empty()
+                && link.outputs.len() == 1
+                && link.inputs.iter().all(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext == "o" || ext == "a" || ext == "so")
+                }),
+            "unity requires complete object/archive/shared-library link consumers"
+        );
+        let mut operands = Vec::new();
+        let mut positional = false;
+        let mut index = 1;
+        while index < link.argv.len() {
+            let arg = &link.argv[index];
+            if !positional && arg == "--" {
+                positional = true;
+            } else if !positional
+                && matches!(
+                    arg.as_str(),
+                    "-I" | "-L" | "-D" | "-o" | "-isystem" | "-iquote" | "-idirafter"
+                )
+            {
+                index += 1;
+            } else if positional || !arg.starts_with('-') {
+                operands.push(index);
+            }
+            index += 1;
+        }
+        Ok((&link.argv, operands))
+    } else if let Some(archive) = record.typed::<Ar>() {
+        Ok((&archive.data.argv, archive_operands(archive)?.collect()))
+    } else {
+        bail!(
+            "unity has an unmodeled object consumer at line {}",
+            record.source.line
+        )
+    }
+}
+
+fn grouped_object(
+    groups: &[Group],
+    group_ids: &BTreeSet<usize>,
+    cwd: &Path,
+    path: &Path,
+) -> Option<usize> {
+    let path = normalize(cwd, path);
+    group_ids
+        .iter()
+        .copied()
+        .find(|&id| groups[id].objects.contains(&path))
+}
+
+fn rewrite_operands(
+    argv: &[String],
+    operands: &[usize],
+    groups: &[Group],
+    group_ids: &BTreeSet<usize>,
+    cwd: &Path,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    argv.iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            let group_id = operands
+                .contains(&index)
+                .then(|| grouped_object(groups, group_ids, cwd, Path::new(arg)))
+                .flatten();
+            match group_id {
+                Some(id) if seen.insert(id) => Some(groups[id].object.to_str().unwrap().into()),
+                Some(_) => None,
+                None => Some(arg.clone()),
+            }
+        })
+        .collect()
+}
+
+fn replace_consumer<T: Job>(
+    record: JobRecord,
+    command: T,
+    groups: &[Group],
+    group_ids: &BTreeSet<usize>,
+    cwd: &Path,
+) -> Result<JobRecord> {
+    let inputs = record.spec.inputs;
+    let outputs = record.spec.outputs;
+    let mut replacement = JobRecord::new(record.source, record.shell, command)?;
+    // Graph policies may add effects beyond the typed argv. Keep those overlays,
+    // except for the old object inputs which no longer exist after fusion.
+    for input in inputs {
+        if grouped_object(groups, group_ids, cwd, &input).is_none()
+            && !replacement.spec.inputs.contains(&input)
+        {
+            replacement.spec.inputs.push(input);
+        }
+    }
+    for output in outputs {
+        if !replacement.spec.outputs.contains(&output) {
+            replacement.spec.outputs.push(output);
+        }
+    }
+    Ok(replacement)
 }
 
 /// Return argv unchanged except the source and a separate `-o OUTPUT` pair.
@@ -152,259 +392,465 @@ fn compile_signature(compiler: &Compiler) -> Result<Vec<String>> {
     Ok(signature)
 }
 
-/// Apply all eligible groups transactionally. Errors leave `graph` unchanged.
-/// Every old object must have a modeled pure link consumer, and every consumer
-/// must read every object in its group once. Header-policy requirements touching
-/// grouped commands are intentionally rejected, rather than weakening stable
-/// source-line requirements while fusing provenance. Other requirements survive.
-pub fn apply_unity(graph: &mut BuildGraph) -> Result<UnityStats> {
-    let mut candidates = BTreeMap::<String, Vec<usize>>::new();
-    for (id, record) in graph.jobs.iter().enumerate() {
-        let Some(compiler) = record.typed::<Compiler>() else {
-            continue;
-        };
-        if !compiler.compile_only {
-            continue;
-        }
-        for source in &compiler.sources {
-            if source.extension().is_some_and(|ext| ext == "c") {
-                let stem = source
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .context("unity source basename must be UTF-8")?;
-                candidates
-                    .entry(stem.split('_').next().unwrap_or(stem).to_owned())
-                    .or_default()
-                    .push(id);
-            }
-        }
+struct Effects {
+    inputs: Vec<PathBuf>,
+    outputs: Vec<PathBuf>,
+}
+
+struct Consumer {
+    operands: Vec<usize>,
+    // Normalized operand -> (occurrence count, contiguous object region).
+    objects: BTreeMap<PathBuf, (usize, usize)>,
+    archive_names: Option<BTreeMap<String, usize>>,
+}
+
+struct UnityPlan {
+    classes: Vec<Vec<usize>>,
+    consumers: Vec<Option<Consumer>>,
+    extra_edges: Vec<Edge>,
+    effects: Vec<Effects>,
+    jobs: Vec<JobRecord>,
+}
+
+fn ordinary_signature(record: &JobRecord, cwd: &Path) -> Option<Vec<String>> {
+    let compiler = record.typed::<Compiler>()?;
+    if !static_command(record)
+        || !compiler
+            .sources
+            .first()?
+            .extension()
+            .is_some_and(|extension| extension == "c")
+    {
+        return None;
     }
-    candidates.retain(|_, members| members.len() > 1);
-    if candidates.is_empty() {
-        return Ok(UnityStats::default());
+    let signature = compile_signature(compiler).ok()?;
+    (record.spec.outputs.len() == 1
+        && normalize(cwd, &record.spec.outputs[0]) == normalize(cwd, &compiler.outputs[0])
+        && !filesystem_alias(&normalize(cwd, &compiler.outputs[0])))
+    .then_some(signature)
+}
+
+fn filesystem_alias(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.nlink() > 1)
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn unity_plan(graph: &BuildGraph) -> Result<UnityPlan> {
+    graph.topological_waves()?;
     ensure!(
         graph.provenance.len() == graph.jobs.len(),
         "unity requires complete graph provenance"
     );
-    let mut groups = Vec::new();
-    let mut grouped = BTreeSet::new();
-    for (ordinal, (name, members)) in candidates.into_iter().enumerate() {
-        let first = graph.jobs[members[0]].typed::<Compiler>().unwrap();
-        let signature = compile_signature(first).with_context(|| format!("unity group {name}"))?;
-        let mut sources = Vec::new();
-        let mut objects = Vec::new();
-        for &id in &members {
-            ensure!(
-                grouped.insert(id),
-                "unity does not support multi-source compile commands"
-            );
-            let record = &graph.jobs[id];
-            ensure!(
-                static_command(record),
-                "unity group {name} requires static commands without redirection"
-            );
-            let compiler = record.typed::<Compiler>().unwrap();
-            let current =
-                compile_signature(compiler).with_context(|| format!("unity group {name}"))?;
-            ensure!(
-                signature == current,
-                "unity group {name} has incompatible compiler/flags at source line {}: expected {:?}, got {:?}",
-                record.source.line,
-                signature,
-                current
-            );
-            include_name(&graph.cwd.join(&compiler.sources[0]))?;
-            sources.push(compiler.sources[0].clone());
-            objects.push(normalize(&graph.cwd, &compiler.outputs[0]));
-        }
+    let mut source_nodes = BTreeMap::new();
+    for (id, (record, originals)) in graph.jobs.iter().zip(&graph.provenance).enumerate() {
         ensure!(
-            objects.iter().collect::<BTreeSet<_>>().len() == objects.len(),
-            "unity group {name} repeats an object output"
-        );
-        ensure!(
-            sources
+            originals
                 .iter()
-                .map(|source| normalize(&graph.cwd, source))
-                .collect::<BTreeSet<_>>()
-                .len()
-                == sources.len(),
-            "unity group {name} repeats a source translation unit"
+                .any(|original| original.source.line == record.source.line),
+            "unity provenance omits executable source identity"
         );
-        // Moving members across a file-producing non-compiler could change
-        // implicit header inputs, even when that producer has precise effects.
-        let first_member = *members.first().unwrap();
-        let last_member = *members.last().unwrap();
-        for intervening in &graph.jobs[first_member..=last_member] {
-            if let Some(compiler) = intervening.typed::<Compiler>() {
+        for original in originals {
+            if let Some(previous) = source_nodes.insert(original.source.line, id) {
                 ensure!(
-                    compiler.metadata_complete
-                        && static_command(intervening)
-                        && compiler.compile_only
-                        && compiler.sources.len() == 1
-                        && compiler.sources[0]
-                            .extension()
-                            .is_some_and(|extension| extension == "c")
-                        && compiler.outputs.len() == 1
-                        && compiler.outputs[0]
-                            .extension()
-                            .is_some_and(|extension| extension == "o"),
-                    "unity cannot cross a compiler with unmodeled implicit input/output changes"
-                );
-            } else {
-                ensure!(
-                    intervening.spec.outputs.is_empty(),
-                    "unity cannot cross a file-producing command that may change implicit headers"
+                    previous == id,
+                    "unity provenance has ambiguous source identities"
                 );
             }
         }
+    }
+    let required_lines: BTreeSet<_> = graph
+        .required_dependencies
+        .iter()
+        .flat_map(|required| [required.producer_line, required.consumer_line])
+        .collect();
+    // Rebuild the automatic baseline to distinguish authored constraints from
+    // the compiler's default implicit-header ordering barriers. Only provenance
+    // referenced by a requirement is needed by rebuild; do not clone discarded
+    // historical snapshots or derived graph vectors.
+    let mut baseline = BuildGraph {
+        jobs: graph.jobs.clone(),
+        edges: Vec::new(),
+        required_dependencies: graph.required_dependencies.clone(),
+        waves: Vec::new(),
+        cwd: graph.cwd.clone(),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        decisions: Vec::new(),
+        diagnostics: Vec::new(),
+        provenance: graph
+            .provenance
+            .iter()
+            .map(|originals| {
+                originals
+                    .iter()
+                    .filter(|original| required_lines.contains(&original.source.line))
+                    .cloned()
+                    .collect()
+            })
+            .collect(),
+    };
+    baseline.rebuild()?;
+    let baseline_edges: BTreeSet<_> = baseline
+        .edges
+        .iter()
+        .map(|edge| (edge.from, edge.to, edge.reason.as_str()))
+        .collect();
+    let extra_edges: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|edge| !baseline_edges.contains(&(edge.from, edge.to, edge.reason.as_str())))
+        .cloned()
+        .collect();
+    let constrained: BTreeSet<_> = extra_edges
+        .iter()
+        .flat_map(|edge| [edge.from, edge.to])
+        .collect();
+    let effects: Vec<_> = baseline
+        .jobs
+        .iter()
+        .map(|record| Effects {
+            inputs: record
+                .spec
+                .inputs
+                .iter()
+                .map(|path| normalize(&graph.cwd, path))
+                .collect(),
+            outputs: record
+                .spec
+                .outputs
+                .iter()
+                .map(|path| normalize(&graph.cwd, path))
+                .collect(),
+        })
+        .collect();
+    let consumers: Vec<_> = baseline
+        .jobs
+        .iter()
+        .map(|record| {
+            let (argv, operands) = consumer_arguments(record).ok()?;
+            let archive = record.typed::<Ar>().is_some();
+            let mut objects = BTreeMap::new();
+            let mut region = 0;
+            let mut previous = None;
+            let mut archive_names = archive.then(BTreeMap::<String, usize>::new);
+            for &index in &operands {
+                let path = Path::new(&argv[index]);
+                if let Some(names) = &mut archive_names {
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        *names.entry(name.to_owned()).or_default() += 1;
+                    }
+                }
+                if !archive && !path.extension().is_some_and(|extension| extension == "o") {
+                    previous = None;
+                    continue;
+                }
+                if !archive && previous != index.checked_sub(1) {
+                    region += 1;
+                }
+                let entry = objects
+                    .entry(normalize(&graph.cwd, path))
+                    .or_insert((0, region));
+                entry.0 += 1;
+                previous = Some(index);
+            }
+            Some(Consumer {
+                operands,
+                objects,
+                archive_names,
+            })
+        })
+        .collect();
+    let hidden_consumers = baseline
+        .jobs
+        .iter()
+        .zip(&consumers)
+        .any(|(record, consumer)| {
+            if let Some(compiler) = record.typed::<Compiler>() {
+                !compiler.metadata_complete
+                    || !static_command(record)
+                    || (!compiler.compile_only && consumer.is_none())
+            } else {
+                record.spec.unknown_effects
+            }
+        });
+    let mut plan = UnityPlan {
+        classes: Vec::new(),
+        consumers,
+        extra_edges,
+        effects,
+        jobs: Vec::new(),
+    };
+    // Unknown jobs may hide uses of *any* removed object, not just declared
+    // inputs. Conservatively leave the graph untouched rather than guessing.
+    if hidden_consumers {
+        plan.jobs = baseline.jobs;
+        return Ok(plan);
+    }
+    let signatures: Vec<_> = baseline
+        .jobs
+        .iter()
+        .map(|record| ordinary_signature(record, &graph.cwd))
+        .collect();
+    let mut source_counts = BTreeMap::<PathBuf, usize>::new();
+    for record in &baseline.jobs {
+        if let Some(compiler) = record.typed::<Compiler>() {
+            for source in &compiler.sources {
+                *source_counts
+                    .entry(normalize(&graph.cwd, source))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let mut classes = BTreeMap::<(Vec<String>, usize, Vec<(usize, usize)>), Vec<usize>>::new();
+    let mut epoch = 0;
+    for (id, (record, compiler_signature)) in baseline.jobs.iter().zip(signatures).enumerate() {
+        let Some(compiler_signature) = compiler_signature else {
+            if record.typed::<Compiler>().is_some()
+                || record.spec.unknown_effects
+                || !plan.effects[id].outputs.is_empty()
+            {
+                epoch += 1;
+            }
+            continue;
+        };
+        if constrained.contains(&id)
+            || graph.provenance[id]
+                .iter()
+                .any(|original| required_lines.contains(&original.source.line))
+        {
+            continue;
+        }
+        let compiler = record.typed::<Compiler>().unwrap();
+        let source = normalize(&graph.cwd, &compiler.sources[0]);
+        let object = normalize(&graph.cwd, &compiler.outputs[0]);
+        let effects = &plan.effects[id];
+        if source_counts.get(&source) != Some(&1)
+            || include_name(&graph.cwd.join(&compiler.sources[0])).is_err()
+            || effects.outputs.len() != 1
+            || effects.outputs[0] != object
+            || effects
+                .inputs
+                .iter()
+                .chain(&effects.outputs)
+                .any(|path| filesystem_alias(path))
+        {
+            continue;
+        }
+        let mut signature = Vec::new();
+        let mut safe = true;
+        for (other, other_effects) in plan.effects.iter().enumerate() {
+            if other_effects.outputs.iter().any(|output| {
+                (other != id && overlaps(output, &object))
+                    || effects.inputs.iter().any(|input| overlaps(output, input))
+            }) {
+                safe = false;
+                break;
+            }
+            let reads = other_effects
+                .inputs
+                .iter()
+                .filter(|input| overlaps(input, &object))
+                .count();
+            if reads == 0 {
+                if plan.consumers[other]
+                    .as_ref()
+                    .is_some_and(|consumer| consumer.objects.contains_key(&object))
+                {
+                    safe = false;
+                    break;
+                }
+                continue;
+            }
+            let Some(consumer) = &plan.consumers[other] else {
+                safe = false;
+                break;
+            };
+            let Some(&(occurrences, region)) = consumer.objects.get(&object) else {
+                safe = false;
+                break;
+            };
+            if other <= id
+                || reads != 1
+                || occurrences != 1
+                || !other_effects.inputs.iter().any(|input| input == &object)
+            {
+                safe = false;
+                break;
+            }
+            if let Some(names) = &consumer.archive_names {
+                let Some(name) = object.file_name().and_then(|name| name.to_str()) else {
+                    safe = false;
+                    break;
+                };
+                if !safe_member_name(name) || names.get(name) != Some(&1) {
+                    safe = false;
+                    break;
+                }
+            }
+            signature.push((other, region));
+        }
+        if safe && !signature.is_empty() {
+            classes
+                .entry((compiler_signature, epoch, signature))
+                .or_default()
+                .push(id);
+        }
+    }
+    plan.classes = classes
+        .into_values()
+        .filter(|members| members.len() >= 2)
+        .collect();
+    plan.classes.sort_by_key(|members| members[0]);
+    plan.jobs = baseline.jobs;
+    Ok(plan)
+}
+
+/// Discover maximal command/consumer-compatible classes, before naming policy.
+/// Opaque jobs can hide object uses, so such graphs conservatively return none.
+pub fn safe_unity_groups(graph: &BuildGraph) -> Result<Vec<Vec<usize>>> {
+    Ok(unity_plan(graph)?.classes)
+}
+
+/// Apply the default filename-prefix policy only inside graph-safe classes.
+pub fn apply_unity(graph: &mut BuildGraph) -> Result<UnityStats> {
+    apply_unity_with(graph, |_, source| {
+        let stem = source.file_stem()?.to_str()?;
+        Some(stem.split('_').next().unwrap_or(stem).to_owned())
+    })
+}
+
+/// Subdivide safe classes with a policy; `None` leaves a member standalone.
+/// A constant `Some(())` uses the complete safe classes without subdivision.
+/// Errors are transactional, and a no-op leaves graph serialization unchanged.
+pub fn apply_unity_with<K: Ord, F>(graph: &mut BuildGraph, mut policy: F) -> Result<UnityStats>
+where
+    F: FnMut(&JobRecord, &Path) -> Option<K>,
+{
+    let plan = unity_plan(graph)?;
+    let mut candidates = Vec::new();
+    for class in &plan.classes {
+        let mut partitions = BTreeMap::<K, Vec<usize>>::new();
+        for &id in class {
+            let record = &graph.jobs[id];
+            let source = &record.typed::<Compiler>().unwrap().sources[0];
+            if let Some(key) = policy(record, source) {
+                partitions.entry(key).or_default().push(id);
+            }
+        }
+        candidates.extend(
+            partitions
+                .into_values()
+                .filter(|members| members.len() >= 2),
+        );
+    }
+    candidates.sort_by_key(|members| members[0]);
+    let mut groups = Vec::new();
+    let mut grouped = BTreeSet::new();
+    let mut consumers = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let directory = normalize(&graph.cwd, Path::new(".rusty_make/unity"));
+    // An artifact containing the whole namespace cannot be escaped by choosing
+    // another ordinal. Also avoid descending through an existing non-directory.
+    if plan.effects.iter().any(|effects| {
+        effects
+            .inputs
+            .iter()
+            .chain(&effects.outputs)
+            .any(|path| directory.starts_with(path))
+    }) || directory
+        .ancestors()
+        .any(|path| match fs::symlink_metadata(path) {
+            Ok(metadata) => !metadata.is_dir(),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
+    {
+        return Ok(UnityStats::default());
+    }
+    let mut ordinal = 0usize;
+    for members in candidates {
+        let (source, object) = loop {
+            let source = PathBuf::from(format!(".rusty_make/unity/tu-{ordinal}.c"));
+            let object = PathBuf::from(format!(".rusty_make/unity/tu-{ordinal}.o"));
+            ordinal = ordinal
+                .checked_add(1)
+                .context("unity namespace exhausted")?;
+            let conflict = [&source, &object].into_iter().any(|path| {
+                let absolute = normalize(&graph.cwd, path);
+                fs::symlink_metadata(graph.cwd.join(path)).is_ok()
+                    || plan.effects.iter().any(|effects| {
+                        effects
+                            .inputs
+                            .iter()
+                            .chain(&effects.outputs)
+                            .any(|effect| overlaps(&absolute, effect))
+                    })
+            });
+            let archive_conflict = plan.consumers.iter().flatten().any(|consumer| {
+                consumer.archive_names.as_ref().is_some_and(|names| {
+                    names.contains_key(object.file_name().unwrap().to_str().unwrap())
+                })
+            });
+            if !conflict && !archive_conflict {
+                break (source, object);
+            }
+        };
+        let sources = members
+            .iter()
+            .map(|&id| graph.jobs[id].typed::<Compiler>().unwrap().sources[0].clone())
+            .collect();
+        let objects = members
+            .iter()
+            .map(|&id| {
+                normalize(
+                    &graph.cwd,
+                    &graph.jobs[id].typed::<Compiler>().unwrap().outputs[0],
+                )
+            })
+            .collect::<Vec<_>>();
+        let group_id = groups.len();
+        for (id, consumer) in plan.consumers.iter().enumerate() {
+            if consumer
+                .as_ref()
+                .is_some_and(|consumer| consumer.objects.contains_key(&objects[0]))
+            {
+                consumers.entry(id).or_default().insert(group_id);
+            }
+        }
+        grouped.extend(members.iter().copied());
         groups.push(Group {
-            name,
+            name: format!("tu-{}", ordinal - 1),
             members,
             sources,
             objects,
-            source: PathBuf::from(format!(".rusty_make/unity/tu-{ordinal}.c")),
-            object: PathBuf::from(format!(".rusty_make/unity/tu-{ordinal}.o")),
+            source,
+            object,
         });
     }
-    ensure!(
-        graph.jobs.iter().all(|record| !record.spec.unknown_effects
-            || record
-                .typed::<Compiler>()
-                .is_some_and(|compiler| compiler.metadata_complete && static_command(record))),
-        "unity refuses graphs containing opaque or unknown-effect commands"
-    );
-    let grouped_lines: BTreeSet<_> = grouped
-        .iter()
-        .flat_map(|&id| graph.provenance[id].iter().map(|j| j.source.line))
-        .collect();
-    for required in &graph.required_dependencies {
-        ensure!(
-            !grouped_lines.contains(&required.producer_line)
-                && !grouped_lines.contains(&required.consumer_line),
-            "unity cannot merge commands with required header/artifact dependencies (lines {} -> {}); keep those commands standalone",
-            required.producer_line,
-            required.consumer_line
-        );
-    }
-    let mut consumers = BTreeMap::<usize, BTreeSet<usize>>::new();
-    for (group_id, group) in groups.iter().enumerate() {
-        let mut found = false;
-        for path in [&group.source, &group.object] {
-            let path = normalize(&graph.cwd, path);
-            ensure!(
-                !path.exists(),
-                "unity generated path already exists: {}",
-                path.display()
-            );
-            ensure!(
-                !graph.jobs.iter().any(|j| j
-                    .spec
-                    .inputs
-                    .iter()
-                    .chain(&j.spec.outputs)
-                    .any(|p| overlaps(&path, &normalize(&graph.cwd, p)))),
-                "unity generated path conflicts with graph artifacts: {}",
-                path.display()
-            );
-        }
-        for (id, record) in graph.jobs.iter().enumerate() {
-            let reads_object = record.spec.inputs.iter().any(|path| {
-                group
-                    .objects
-                    .iter()
-                    .any(|object| overlaps(object, &normalize(&graph.cwd, path)))
-            });
-            if !group.members.contains(&id) {
-                ensure!(
-                    !record.spec.outputs.iter().any(|path| group
-                        .objects
-                        .iter()
-                        .any(|object| overlaps(object, &normalize(&graph.cwd, path)))),
-                    "unity group {} has another object writer at line {}",
-                    group.name,
-                    record.source.line
-                );
-            }
-            // Moving source compilation is unsafe across generated or mutated
-            // source inputs; generated-header policies are rejected above.
-            ensure!(
-                !record
-                    .spec
-                    .outputs
-                    .iter()
-                    .any(|path| group.members.iter().any(|&member| graph.jobs[member]
-                        .spec
-                        .inputs
-                        .iter()
-                        .any(|input| overlaps(
-                            &normalize(&graph.cwd, path),
-                            &normalize(&graph.cwd, input)
-                        )))),
-                "unity group {} has generated or mutated source inputs; keep it standalone",
-                group.name
-            );
-            if !reads_object {
-                continue;
-            }
-            let link = record.typed::<Compiler>().with_context(|| {
-                format!(
-                    "unity group {} has an unmodeled object consumer at line {}",
-                    group.name, record.source.line
-                )
-            })?;
-            ensure!(
-                static_command(record)
-                    && link.metadata_complete
-                    && !link.compile_only
-                    && link.sources.is_empty()
-                    && link.outputs.len() == 1
-                    && link
-                        .inputs
-                        .iter()
-                        .all(|p| p.extension().is_some_and(|ext| ext == "o")),
-                "unity group {} requires pure complete object-only link consumers (line {})",
-                group.name,
-                record.source.line
-            );
-            for object in &group.objects {
-                let inputs = record
-                    .spec
-                    .inputs
-                    .iter()
-                    .filter(|p| normalize(&graph.cwd, p) == *object)
-                    .count();
-                let operands = link
-                    .argv
-                    .iter()
-                    .skip(1)
-                    .filter(|p| normalize(&graph.cwd, Path::new(p)) == *object)
-                    .count();
-                ensure!(
-                    inputs == 1 && operands == 1,
-                    "unity link at line {} must consume the whole group {} exactly once",
-                    record.source.line,
-                    group.name
-                );
-            }
-            ensure!(
-                group.members.iter().all(|&member| member < id),
-                "unity requires link consumers after their compiles"
-            );
-            consumers.entry(id).or_default().insert(group_id);
-            found = true;
-        }
-        ensure!(
-            found,
-            "unity group {} has final object outputs without a complete link consumer",
-            group.name
-        );
+    if groups.is_empty() {
+        return Ok(UnityStats::default());
     }
 
     // Only mutate a private graph. Even rebuild/cycle errors are transactional.
-    let mut result = graph.clone();
-    result.jobs.clear();
-    result.provenance.clear();
+    let mut result = BuildGraph {
+        jobs: Vec::with_capacity(graph.jobs.len() + groups.len()),
+        edges: Vec::new(),
+        required_dependencies: graph.required_dependencies.clone(),
+        waves: Vec::new(),
+        cwd: graph.cwd.clone(),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        decisions: graph.decisions.clone(),
+        diagnostics: graph.diagnostics.clone(),
+        provenance: Vec::with_capacity(graph.jobs.len() + groups.len()),
+    };
+    let mut remapped = vec![usize::MAX; graph.jobs.len()];
     let mut next_line = graph
         .jobs
         .iter()
@@ -412,7 +858,7 @@ pub fn apply_unity(graph: &mut BuildGraph) -> Result<UnityStats> {
         .map(|j| j.source.line)
         .max()
         .unwrap_or(0);
-    for (id, record) in graph.jobs.iter().enumerate() {
+    for (id, record) in plan.jobs.into_iter().enumerate() {
         if let Some(group) = groups.iter().find(|group| group.members[0] == id) {
             next_line = next_line
                 .checked_add(1)
@@ -449,53 +895,74 @@ pub fn apply_unity(graph: &mut BuildGraph) -> Result<UnityStats> {
                     }
                 }
             }
-            let mut replacement = record.clone();
-            replacement.replace(compiler)?;
+            let replacement = JobRecord::new(record.source, record.shell, compiler)?;
+            for &member in &group.members {
+                remapped[member] = result.jobs.len();
+            }
             result.jobs.push(replacement);
             result.provenance.push(
                 group
                     .members
                     .iter()
-                    .flat_map(|&member| graph.provenance[member].clone())
+                    .flat_map(|&member| graph.provenance[member].iter().cloned())
                     .collect(),
             );
         } else if !grouped.contains(&id) {
-            let mut replacement = record.clone();
-            if let Some(group_ids) = consumers.get(&id) {
-                let old = record.typed::<Compiler>().unwrap();
-                let mut seen = BTreeSet::new();
-                let mut argv = Vec::new();
-                for (index, arg) in old.argv.iter().enumerate() {
-                    let matched = if index == 0 {
-                        None
-                    } else {
-                        group_ids.iter().copied().find(|&group_id| {
-                            groups[group_id]
-                                .objects
-                                .contains(&normalize(&graph.cwd, Path::new(arg)))
-                        })
-                    };
-                    if let Some(group_id) = matched {
-                        if seen.insert(group_id) {
-                            argv.push(groups[group_id].object.to_str().unwrap().into());
+            remapped[id] = result.jobs.len();
+            let replacement = if let Some(group_ids) = consumers.get(&id) {
+                let consumer = plan.consumers[id]
+                    .as_ref()
+                    .context("unity lost a modeled consumer")?;
+                let old_argv = if let Some(compiler) = record.typed::<Compiler>() {
+                    &compiler.argv
+                } else {
+                    &record
+                        .typed::<Ar>()
+                        .context("unity lost an archive consumer")?
+                        .data
+                        .argv
+                };
+                let argv =
+                    rewrite_operands(old_argv, &consumer.operands, &groups, group_ids, &graph.cwd);
+                if record.typed::<Compiler>().is_some() {
+                    replace_consumer(
+                        record,
+                        Compiler::from_argv(argv)?,
+                        &groups,
+                        group_ids,
+                        &graph.cwd,
+                    )?
+                } else {
+                    let archive = Ar::parse(&static_shell(&argv)?)?;
+                    let mut stale_members = Vec::new();
+                    for &group_id in group_ids {
+                        for object in &groups[group_id].objects {
+                            let name = object
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .context("unity archive requires UTF-8 object basenames")?;
+                            ensure!(
+                                safe_member_name(name),
+                                "unity archive has an unsafe stale member basename"
+                            );
+                            stale_members.push(name.to_owned());
                         }
-                    } else {
-                        argv.push(arg.clone());
                     }
+                    let command = UnityArchive {
+                        archive,
+                        stale_members,
+                    };
+                    let replacement =
+                        replace_consumer(record, command, &groups, group_ids, &graph.cwd)?;
+                    replacement
+                        .typed::<UnityArchive>()
+                        .unwrap()
+                        .validate(&replacement, &graph.cwd)?;
+                    replacement
                 }
-                let mut compiler = Compiler::from_argv(argv)?;
-                for input in &record.spec.inputs {
-                    if !group_ids.iter().any(|&group_id| {
-                        groups[group_id]
-                            .objects
-                            .contains(&normalize(&graph.cwd, input))
-                    }) && !compiler.inputs.contains(input)
-                    {
-                        compiler.inputs.push(input.clone());
-                    }
-                }
-                replacement.replace(compiler)?;
-            }
+            } else {
+                record
+            };
             result.jobs.push(replacement);
             result.provenance.push(graph.provenance[id].clone());
         }
@@ -510,6 +977,20 @@ pub fn apply_unity(graph: &mut BuildGraph) -> Result<UnityStats> {
         stats.original_compiles, stats.unity_compiles, stats.groups
     ));
     result.rebuild()?;
+    for edge in plan.extra_edges {
+        let from = remapped[edge.from];
+        let to = remapped[edge.to];
+        ensure!(
+            from != usize::MAX && to != usize::MAX,
+            "unity lost an authored constraint endpoint"
+        );
+        result.edges.push(Edge {
+            from,
+            to,
+            reason: edge.reason,
+        });
+    }
+    result.waves = result.topological_waves()?;
     *graph = result;
     Ok(stats)
 }

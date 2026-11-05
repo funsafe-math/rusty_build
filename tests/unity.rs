@@ -38,15 +38,11 @@ fn graph(text: &str, root: &Path) -> BuildGraph {
 fn snapshot(graph: &BuildGraph) -> Vec<u8> {
     serde_json::to_vec(graph).unwrap()
 }
-fn rejected_unchanged(text: &str, expected: &str) {
+fn standalone_unchanged(text: &str) {
     let root = workspace();
     let mut graph = graph(text, root.path());
     let before = snapshot(&graph);
-    let error = apply_unity(&mut graph).unwrap_err();
-    assert!(
-        format!("{error:#}").contains(expected),
-        "unexpected error: {error:#}"
-    );
+    assert_eq!(apply_unity(&mut graph).unwrap().groups, 0);
     assert_eq!(before, snapshot(&graph));
     assert!(!root.path().join(".rusty_make").exists());
     assert_eq!(fs::read_dir(root.path().join("build")).unwrap().count(), 0);
@@ -170,27 +166,19 @@ fn singleton_is_unchanged_even_when_another_group_is_transformed() {
 }
 
 #[test]
-fn mismatched_flags_and_compiler_reject_before_mutation() {
-    rejected_unchanged(
-        &COMMANDS.replace("-O2 -c src/calc_mul.c", "-O0 -c src/calc_mul.c"),
-        "incompatible compiler/flags",
-    );
-    rejected_unchanged(
+fn mismatched_flags_and_compilers_remain_standalone() {
+    standalone_unchanged(&COMMANDS.replace("-O2 -c src/calc_mul.c", "-O0 -c src/calc_mul.c"));
+    standalone_unchanged(
         &COMMANDS.replace("cc -O2 -c src/calc_mul.c", "gcc -O2 -c src/calc_mul.c"),
-        "incompatible compiler/flags",
     );
-    rejected_unchanged(
+    standalone_unchanged(
         &COMMANDS.replace("-O2 -c src/calc_mul.c", "-O2 -DOTHER=1 -c src/calc_mul.c"),
-        "incompatible compiler/flags",
     );
 }
 
 #[test]
 fn exact_argument_order_is_part_of_compatibility() {
-    rejected_unchanged(
-        &COMMANDS.replace("cc -O2 -c src/calc_mul.c", "cc -c -O2 src/calc_mul.c"),
-        "incompatible compiler/flags",
-    );
+    standalone_unchanged(&COMMANDS.replace("cc -O2 -c src/calc_mul.c", "cc -c -O2 src/calc_mul.c"));
 }
 
 #[test]
@@ -221,49 +209,29 @@ fn all_link_consumers_are_rewritten_exactly_once() {
 }
 
 #[test]
-fn partial_duplicate_final_and_unmodeled_object_consumers_reject() {
-    rejected_unchanged(
-        &format!("{COMMANDS}cc build/calc_add.o build/main.o -o build/partial\n"),
-        "whole group",
-    );
-    rejected_unchanged(
-        &COMMANDS.replace(
-            "cc build/calc_add.o",
-            "cc build/calc_add.o build/calc_add.o",
-        ),
-        "whole group",
-    );
-    rejected_unchanged(
-        &COMMANDS.lines().take(3).collect::<Vec<_>>().join("\n"),
-        "final object outputs",
-    );
-    rejected_unchanged(
-        &format!("{COMMANDS}cp build/calc_add.o build/copied.o\n"),
-        "unmodeled object consumer",
-    );
-    rejected_unchanged(
-        &format!("{COMMANDS}echo opaque\n"),
-        "opaque or unknown-effect",
-    );
+fn partial_duplicate_final_and_unmodeled_consumers_remain_standalone() {
+    standalone_unchanged(&format!(
+        "{COMMANDS}cc build/calc_add.o build/main.o -o build/partial\n"
+    ));
+    standalone_unchanged(&COMMANDS.replace(
+        "cc build/calc_add.o",
+        "cc build/calc_add.o build/calc_add.o",
+    ));
+    standalone_unchanged(&COMMANDS.lines().take(3).collect::<Vec<_>>().join("\n"));
+    standalone_unchanged(&format!("{COMMANDS}cp build/calc_add.o build/copied.o\n"));
+    standalone_unchanged(&format!("{COMMANDS}echo opaque\n"));
 }
 
 #[test]
-fn redirects_and_incomplete_compiler_metadata_reject() {
-    rejected_unchanged(
-        &COMMANDS.replace(
-            "-o build/calc_add.o",
-            "-o build/calc_add.o > build/compiler.log",
-        ),
-        "redirection",
-    );
-    rejected_unchanged(
-        &COMMANDS.replace("-O2 -c src/calc_add.c", "-O2 -c src/calc_add.c -fPIC"),
-        "complete compile-only",
-    );
+fn redirected_compiler_commands_remain_standalone() {
+    standalone_unchanged(&COMMANDS.replace(
+        "-o build/calc_add.o",
+        "-o build/calc_add.o > build/compiler.log",
+    ));
 }
 
 #[test]
-fn required_source_line_policies_reject_without_losing_graph_requirements() {
+fn required_source_line_policies_keep_affected_compiles_standalone() {
     let root = workspace();
     let mut graph = graph(COMMANDS, root.path());
     graph.required_dependencies.push(RequiredDependency {
@@ -274,12 +242,7 @@ fn required_source_line_policies_reject_without_losing_graph_requirements() {
     });
     graph.rebuild().unwrap();
     let before = snapshot(&graph);
-    let error = apply_unity(&mut graph).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("required header/artifact dependencies")
-    );
+    assert_eq!(apply_unity(&mut graph).unwrap().groups, 0);
     assert_eq!(before, snapshot(&graph));
     assert!(!root.path().join(".rusty_make").exists());
 }
@@ -331,12 +294,7 @@ fn configured_arbitrary_compiler_names_are_accepted_but_not_mixed() {
     );
     let mut graph = parse_plan(&incompatible, root.path(), &registry).unwrap();
     let before = snapshot(&graph);
-    assert!(
-        apply_unity(&mut graph)
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible compiler/flags")
-    );
+    assert_eq!(apply_unity(&mut graph).unwrap().groups, 0);
     assert_eq!(before, snapshot(&graph));
 }
 
@@ -401,7 +359,7 @@ fn intervening_header_mutation_cannot_be_crossed_by_unity_compilation() {
     );
     let mut original = graph(&commands, root.path());
     let before = snapshot(&original);
-    assert!(apply_unity(&mut original).is_err());
+    assert_eq!(apply_unity(&mut original).unwrap().groups, 0);
     assert_eq!(snapshot(&original), before);
     assert!(!root.path().join(".rusty_make").exists());
     assert_eq!(

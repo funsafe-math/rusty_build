@@ -172,7 +172,9 @@ flowchart LR
 * `scheduler.rs`: deterministic waves, then concrete-type/kind/strategy groups.
   Each group invokes its typed batch override once through an erased adapter.
   The default batch loop executes members sequentially; handlers can override it.
-  Different groups can run concurrently up to `--jobs`. Native groups avoid subprocesses.
+  Ready groups use `rayon::prelude::*` and `par_iter().for_each` in a dedicated
+  pool bounded by `--jobs`. The pool is created lazily and reused across waves;
+  dry-runs and entirely cached builds create no pool. Native groups avoid subprocesses.
   Compiler and opaque jobs retain conservative ordering except for explicit selected
   generated-header prerequisites. First failure cancels not-yet-started work;
   already-running independent
@@ -217,31 +219,89 @@ cargo run --example unity_build
 ```
 
 [`examples/support/unity_transform.rs`](examples/support/unity_transform.rs)
-groups `.c` basenames by their stem component before `_`: `calc_add.c` and
-`calc_mul.c` merge, while singleton `main.c` stays separate. Groups require one
-compile-only C source and one explicit `.o` output per command, static shell
-words, complete metadata, and exactly equal compiler executable and argument
-order after removing only the source and separate `-o OUTPUT`.
+plans from the graph first; filename heuristics never define the safety boundary.
+
+```mermaid
+flowchart LR
+    A[Graph and compiler arguments] --> B[Maximal graph-compatible groups]
+    B --> C[Optional heuristic subdivision]
+    B --> E[Ineligible standalone jobs]
+    C --> D[Unity producers and consumer rewrites]
+    C --> E
+    D --> F[Validated executable graph]
+    E --> F
+```
+
+`safe_unity_groups(&graph)?` proposes groups of original job IDs before any
+heuristic runs. Members require compatible compiler executable/arguments, matching
+consumer sets and object-operand regions, and compatible movement/dependency
+constraints. Only static, complete, one-source `.c` compiles with an explicit `.o`
+output participate. Original source/output operands are excluded from argument
+comparison; all remaining arguments retain their exact order.
+
+`apply_unity` then subdivides each safe group by the filename stem before `_`.
+Thus `calc_add.c` and `calc_mul.c` can merge while `main.c` stays separate—but the
+same `calc_` prefix cannot join files belonging to incompatible libraries.
+
+For a different policy, `apply_unity_with` accepts a per-member partition key.
+Equal keys combine only **within** an already-safe group; `None` keeps a member
+standalone. A constant key disables filename subdivision:
+
+```rust
+let groups = unity_transform::safe_unity_groups(&graph)?;
+// Inspect the proposed original job IDs before selecting a policy.
+unity_transform::apply_unity_with(&mut graph, |_, _| Some(()))?;
+```
+
+These are maximal buckets under the modeled compatibility rules, not a global
+compile-time/memory optimizer or a proof of C source-level unity compatibility.
 
 A registered internal `UnitySource` job generates one translation unit; one
-compiler produces one unity object. Every modeled pure-object link consumer
-replaces all group objects with that object exactly once. Original object files
-are **not** fabricated. Original compilation commands remain in provenance and
-compilation-database exports. Planning and rejection do not write generated files;
-the graph is replaced only after validation succeeds.
+compiler produces one unity object. Modeled consumers replace all grouped object
+operands with that object exactly once:
 
-The runnable example compares isolated standalone/unity builds and checks the
-application output, compiler invocation count and absence of old object outputs.
-Its scope is intentionally conservative: opaque commands, unknown compiler flags,
-response files, redirects, partial/unmodeled object consumers, generated source
-inputs and required dependencies touching grouped commands reject the transform.
-It also refuses to move grouped compilation across file-producing non-compiler
-commands that could change implicit headers. Unrelated required dependencies survive.
+* Compiler links with explicit `.o`, `.a` and `.so` inputs, including `-shared`.
+  Other operands retain their order; groups may not cross library/option boundaries.
+* Traditional `ar r` updates with `c`, `s` and `D` modifiers. A transform-only
+  `UnityArchive` job first removes superseded original member basenames from an
+  existing archive, then invokes the rewritten archive update. This avoids stale
+  objects on non-unity-to-unity transitions while retaining unrelated members.
+* Later `ranlib` jobs and links consuming the library filename remain unchanged;
+  rebuilt dependency edges keep them after the archive producer.
+
+Original object files are **not** fabricated. Original compilation commands remain
+in provenance and compilation-database exports. Planning does not write generated
+files; graph replacement remains transactional.
+Register both `UnitySource` and `UnityArchive` with `register_type` before restoring
+a saved library graph.
+
+The runnable example compares filename-subdivided and whole-safe-group unity builds,
+then converts an existing static-library build and checks its archive contains only
+`tu-0.o`. Regression tests also exercise separate libraries sharing a filename prefix,
+shared libraries, repeated execution, persisted graphs, and preservation of
+unrelated archive members, graph-policy inputs and authored ordering constraints.
+
+Unsafe files stay as their original compilation jobs. Different flags, consumers,
+link regions, required source-line policies, generated/mutated inputs, duplicate
+uses and unsupported consumers split or exclude candidates rather than aborting an
+otherwise valid plan. An unprovable candidate never prevents an independent safe
+group from being considered. Opaque commands/response files/linker scripts may hide
+uses of any removed object, so they can conservatively suppress all proposals;
+that still returns the unchanged graph, not a planning error.
+
+Movement windows prevent crossing file-producing commands that could change
+implicit headers. Existing graph requirements and authored constraints survive.
+Malformed graphs and internal rewrite inconsistencies still fail transactionally.
+Thin/aliased archives remain unsupported, and restored plans fail before archive
+mutation if the archive format or alias state has changed. Archive updates are not
+transactionally rolled back if the external archiver fails after stale-member removal.
 
 Identical flags do **not** prove unity compatibility: static identifiers, macros,
-pragmas, include ordering and `__FILE__` can change C behavior. Source selection
-and compatibility remain the caller's responsibility. This example is opt-in,
-not a default optimization or a claim of arbitrary C source equivalence.
+pragmas, include ordering and `__FILE__` can change C behavior. Static archives now
+extract whole unity objects, which can pull in otherwise unused code/constructors
+or change symbol selection. Source selection and compatibility remain the caller's
+responsibility. This example is opt-in, not a default optimization or a claim of
+arbitrary C source/link equivalence.
 
 
 ## Supported command subsets
@@ -277,6 +337,10 @@ from compilation database entries rather than invented. Default output filenames
 are not inferred when unknown arguments could change the compiler's mode;
 explicit `-o` metadata is retained. Missing values for recognized flags remain
 parsing errors. `--explain` reports partial metadata and preserved arguments.
+
+The zero-operand switches `-fPIC`, `-fpic` and `-shared` are recognized without
+changing argv. They allow modeled shared-library unity builds; compiler effects
+remain conservative and compiler jobs remain non-cacheable.
 
 ### Arbitrary compiler executable names
 
@@ -523,6 +587,28 @@ For another opaque binary tool, use
 all arguments and shell semantics without writing a flag parser; unknown effects
 still force a barrier. Its patterns obey the same fatal ambiguity rules.
 
+### External coan batching
+
+Coan remains an external tool. With `source --replace` and **no filename
+operands**, stdin supplies filenames rather than source text:
+
+```sh
+printf '"%s"\n' src/a.c 'src/b with spaces.c' |
+  coan source --replace -DFEATURE=1
+```
+
+This is coan's quoted/whitespace-delimited filename format, not a NUL-delimited
+stream or general shell quoting; filenames containing quotes/newlines need a
+different input method. One reference invocation was verified to replace both
+files, including the spaced filename.
+
+Coan exit codes are diagnostic/change bitmasks. The successful batch above
+returned **17** (information plus dropped lines); error/abend bits are `4` and `8`.
+A coan-aware caller must interpret the flags and process termination correctly.
+The generic opaque-job executor still treats nonzero status as failure: this
+change does not add automatic coan batching or a coan-specific status adapter.
+
+
 
 [Coreutils investigation](docs/coreutils.md) records reusable uutils crates, their
 in-process APIs, process-global concerns, Windows status, GNU compatibility, MIT
@@ -543,7 +629,7 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **186 passed**, no failures, including real compiler, Python, sed,
+* `cargo test`: **205 passed**, no failures, including real compiler, Python, sed,
   Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
@@ -583,10 +669,16 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   run the application, and verify exact argv and source identities across plan,
   DOT and compilation-database exports. Overlapping/invalid patterns reject the
   whole plan before prefix writes or Make planning side effects.
-* `cargo run --example unity_build`: **4 standalone -> 3 unity** compiler
-  invocations, identical `unity demo: 42 42` output, and no fabricated original
-  objects. Regressions cover multiple link consumers/groups, transactional
-  rejection, implicit-header mutation boundaries and retained link prerequisites.
+* `cargo run --example unity_build`: default filename subdivision reduces **4
+  standalone -> 3 unity** compiler invocations; disabling subdivision uses the whole
+  graph-compatible group and reduces **4 -> 2**. Both print `unity demo: 42 42`.
+  The static-library path reduces 4 to 3 and retains only `tu-0.o` in its archive.
+  Regressions cover matching filename prefixes in different libraries, compiler
+  signature/consumer/operand-region partitions, custom subdivision/exclusion,
+  safe standalone fallback, authored constraints and persisted library behavior.
+* Rayon execution regression: six independent file-producing batches make parallel
+  progress with `--jobs=2`, never exceeding that bound; `--jobs=1` remains serial.
+  Failure cancellation and successful-only cache persistence remain covered.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings

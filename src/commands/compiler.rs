@@ -184,6 +184,10 @@ impl Compiler {
                     "--rusty-debug={}",
                     if level.is_empty() { "2" } else { level }
                 ));
+            } else if !positional_only && matches!(arg.as_str(), "-fPIC" | "-fpic" | "-shared") {
+                // These switches have no operands or extra file effects. Keep
+                // their exact spelling in argv, not clap's metadata grammar.
+                opaque_operands = false;
             } else if (!positional_only && arg.starts_with('-') && arg != "-")
                 || arg.starts_with('@')
             {

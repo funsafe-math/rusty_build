@@ -15,9 +15,10 @@ use rusty_make::{
     scheduler::{RunOptions, run},
 };
 use std::{fs, path::Path, process::Command};
-use unity_transform::apply_unity;
+use unity_transform::{apply_unity, apply_unity_with, safe_unity_groups};
 
 const COMMANDS: &str = include_str!("../fixtures/unity/commands.log");
+const LIBRARY_COMMANDS: &str = include_str!("../fixtures/unity/library-commands.log");
 const EXPECTED: &str = "unity demo: 42 42\n";
 
 fn prepare(root: &Path) -> Result<()> {
@@ -75,6 +76,11 @@ fn main() -> Result<()> {
     let original = parse_plan(COMMANDS, standalone.path(), &registry)?;
     let mut transformed = parse_plan(COMMANDS, unity.path(), &registry)?;
     let before = compiler_invocations(&transformed);
+    let proposals = safe_unity_groups(&transformed)?;
+    ensure!(
+        proposals == vec![vec![0, 1, 2]],
+        "expected all three ordinary compiles in one graph-compatible group"
+    );
     let stats = apply_unity(&mut transformed)?;
     let after = compiler_invocations(&transformed);
     ensure!(
@@ -82,17 +88,19 @@ fn main() -> Result<()> {
         "expected two calc compiles to become one unity compile"
     );
 
-    // Rejection is planning-only and transactional: not even the generated TU
-    // exists, and the original graph's commands/provenance remain untouched.
+    // Compiler-incompatible files remain standalone, without rejecting the plan.
     let mismatch = COMMANDS.replace("-O2 -c src/calc_mul.c", "-O0 -c src/calc_mul.c");
-    let mut rejected = parse_plan(&mismatch, unity.path(), &registry)?;
-    let snapshot = serde_json::to_vec(&rejected)?;
-    let error = apply_unity(&mut rejected).expect_err("incompatible flags must not merge");
+    let mut unmerged = parse_plan(&mismatch, unity.path(), &registry)?;
+    let snapshot = serde_json::to_vec(&unmerged)?;
     ensure!(
-        serde_json::to_vec(&rejected)? == snapshot,
-        "rejection changed the graph"
+        apply_unity(&mut unmerged)?.groups == 0,
+        "incompatible files must not merge under the default filename policy"
     );
-    println!("Unsafe merge rejected: {error}");
+    ensure!(
+        serde_json::to_vec(&unmerged)? == snapshot,
+        "standalone fallback changed the graph"
+    );
+    println!("Incompatible candidates kept standalone; build planning continues");
 
     let standalone_output = execute(&original)?;
     let unity_output = execute(&transformed)?;
@@ -107,5 +115,56 @@ fn main() -> Result<()> {
     );
     println!("Compiler invocations (including link): {before} standalone -> {after} unity");
     print!("{unity_output}");
+
+    // A constant subdivision key opts out of the example's filename heuristic.
+    let maximal = tempfile::tempdir()?;
+    prepare(maximal.path())?;
+    let mut maximal_graph = parse_plan(COMMANDS, maximal.path(), &registry)?;
+    let maximal_stats = apply_unity_with(&mut maximal_graph, |_, _| Some(()))?;
+    ensure!(
+        maximal_stats.original_compiles == 3 && maximal_stats.unity_compiles == 1,
+        "expected one whole graph-compatible group without filename subdivision"
+    );
+    ensure!(
+        execute(&maximal_graph)? == EXPECTED,
+        "unsubdivided unity changed application behavior"
+    );
+    println!(
+        "Without filename subdivision: {before} standalone -> {} unity compiler invocations",
+        compiler_invocations(&maximal_graph)
+    );
+
+    // Start with a real non-unity archive, then migrate that same build root.
+    // Merely adding a unity member would leave stale original archive members.
+    let library = tempfile::tempdir()?;
+    prepare(library.path())?;
+    let original_library = parse_plan(LIBRARY_COMMANDS, library.path(), &registry)?;
+    let baseline = execute(&original_library)?;
+    let mut unity_library = parse_plan(LIBRARY_COMMANDS, library.path(), &registry)?;
+    apply_unity(&mut unity_library)?;
+    ensure!(
+        execute(&unity_library)? == baseline && baseline == EXPECTED,
+        "static-library unity changed application behavior"
+    );
+    let members = Command::new("ar")
+        .args(["t", "build/libcalc.a"])
+        .current_dir(library.path())
+        .output()
+        .context("listing unity archive members")?;
+    ensure!(
+        members.status.success(),
+        "cannot inspect unity archive members"
+    );
+    let members = String::from_utf8(members.stdout)?;
+    ensure!(
+        members == "tu-0.o\n",
+        "stale original objects remain in archive: {members}"
+    );
+    println!(
+        "Static library compiler invocations: {} standalone -> {} unity; archive members: {}",
+        compiler_invocations(&original_library),
+        compiler_invocations(&unity_library),
+        members.trim()
+    );
     Ok(())
 }

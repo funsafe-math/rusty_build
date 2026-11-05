@@ -1,5 +1,6 @@
 use crate::{cache::Cache, graph::BuildGraph, job};
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -7,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -65,6 +66,7 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
     let mut cache = Cache::open(&graph.cwd)?;
     let mut report = RunReport::default();
     let mut unvalidated = vec![false; graph.jobs.len()];
+    let mut pool = None;
     for (wave_index, wave) in graph.topological_waves()?.iter().enumerate() {
         let mut groups = BTreeMap::<(&str, &str, job::ExecutionStrategy), Vec<usize>>::new();
         for &id in wave {
@@ -104,7 +106,8 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
         }
         let groups: Vec<_> = groups.into_iter().collect();
         report.batches += groups.len();
-        report.planned += groups.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+        let planned = groups.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+        report.planned += planned;
         for ((type_tag, kind, strategy), ids) in &groups {
             if options.explain || options.dry_run {
                 eprintln!(
@@ -112,8 +115,16 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
                 );
             }
         }
-        if options.dry_run {
+        if options.dry_run || groups.is_empty() {
             continue;
+        }
+        if pool.is_none() {
+            pool = Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(options.jobs.min(graph.jobs.len()))
+                    .build()
+                    .context("creating scheduler worker pool")?,
+            );
         }
         for (_, ids) in &groups {
             for &id in ids {
@@ -121,46 +132,33 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
             }
         }
         cache.save()?;
-        let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
-        let results = Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for _ in 0..options.jobs.min(groups.len()) {
-                let groups = &groups;
-                let next = &next;
-                let failed = &failed;
-                let results = &results;
-                scope.spawn(move || {
-                    loop {
-                        if failed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let batch = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((_, ids)) = groups.get(batch) else {
-                            break;
-                        };
-                        let context = job::BatchContext {
-                            cwd: &graph.cwd,
-                            cancelled: failed,
-                        };
-                        let report = job::execute_batch(&graph.jobs, ids, &context);
-                        results
-                            .lock()
-                            .unwrap()
-                            .extend(report.outcomes.into_iter().map(|(id, result)| {
-                                (
-                                    id,
-                                    result.with_context(|| {
-                                        format!(
-                                            "node {id}, input line {}: {}",
-                                            graph.jobs[id].source.line, graph.jobs[id].source.text
-                                        )
-                                    }),
+        let results = Mutex::new(Vec::with_capacity(planned));
+        pool.as_ref().unwrap().install(|| {
+            groups.par_iter().for_each(|(_, ids)| {
+                if failed.load(Ordering::Acquire) {
+                    return;
+                }
+                let context = job::BatchContext {
+                    cwd: &graph.cwd,
+                    cancelled: &failed,
+                };
+                let report = job::execute_batch(&graph.jobs, ids, &context);
+                results
+                    .lock()
+                    .unwrap()
+                    .extend(report.outcomes.into_iter().map(|(id, result)| {
+                        (
+                            id,
+                            result.with_context(|| {
+                                format!(
+                                    "node {id}, input line {}: {}",
+                                    graph.jobs[id].source.line, graph.jobs[id].source.text
                                 )
-                            }));
-                    }
-                });
-            }
+                            }),
+                        )
+                    }));
+            });
         });
         let mut results = results.into_inner().unwrap();
         results.sort_by_key(|(id, _)| *id);

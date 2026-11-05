@@ -1,0 +1,6 @@
+cc -O2 -c src/calc_add.c -o build/calc_add.o
+cc -O2 -c src/calc_mul.c -o build/calc_mul.o
+cc -O2 -c src/main.c -o build/main.o
+ar rcs build/libcalc.a build/calc_add.o build/calc_mul.o
+ranlib build/libcalc.a
+cc build/main.o build/libcalc.a -o build/unity-app
