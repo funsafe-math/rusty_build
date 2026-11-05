@@ -60,3 +60,54 @@ fn literal_space_paths_and_sed_redirections_execute_without_flattening() {
         "qux qux\ntail\n"
     );
 }
+
+#[test]
+fn persisted_redirected_jobs_keep_shell_file_effects_and_execute() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("seed"), "foo foo\n").unwrap();
+    let registry = Registry::default();
+    let graph = parse_plan(
+        "cp seed copied > copy.log\nsed -e 's/foo/bar/g' copied > transformed\n",
+        root.path(),
+        &registry,
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&graph).unwrap();
+    let restored = rusty_make::graph::BuildGraph::from_json(&bytes, &registry).unwrap();
+    run(&restored, &RunOptions::default()).unwrap();
+    assert_eq!(fs::read(root.path().join("copied")).unwrap(), b"foo foo\n");
+    assert_eq!(
+        fs::read(root.path().join("transformed")).unwrap(),
+        b"bar bar\n"
+    );
+    assert_eq!(fs::read(root.path().join("copy.log")).unwrap(), b"");
+}
+
+#[test]
+fn persisted_redirected_compiler_executes_its_original_shell_command() {
+    use std::process::Command;
+    if !Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping compiler restoration: cc is unavailable");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("main.c"),
+        "#include <stdio.h>\nint main(void) { puts(\"restored compiler\"); return 0; }\n",
+    )
+    .unwrap();
+    let registry = Registry::default();
+    let graph = parse_plan("cc main.c -o app > compiler.log\n", root.path(), &registry).unwrap();
+    let bytes = serde_json::to_vec(&graph).unwrap();
+    let restored = rusty_make::graph::BuildGraph::from_json(&bytes, &registry).unwrap();
+    run(&restored, &RunOptions::default()).unwrap();
+    let output = Command::new(root.path().join("app")).output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"restored compiler\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(root.path().join("compiler.log")).unwrap(), b"");
+}

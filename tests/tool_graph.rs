@@ -277,8 +277,10 @@ fn existing_thin_archives_keep_their_external_member_barrier() {
     .unwrap();
     assert!(graph.jobs[0].spec.unknown_effects);
     assert!(
-        graph.jobs[0].spec.parsed["effect_reason"]
-            .as_str()
+        graph.jobs[0]
+            .spec
+            .effect_reason
+            .as_deref()
             .unwrap()
             .contains("thin archive")
     );

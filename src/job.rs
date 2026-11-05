@@ -1,551 +1,416 @@
-use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
+use crate::{input::SourceCommand, shell::ShellCommand};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    any::Any,
+    fmt::Debug,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use crate::input::SourceCommand;
-use crate::shell::ShellCommand;
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ExecutionStrategy {
     External,
     Batched,
     Internal,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Operation {
-    Copy {
-        src: PathBuf,
-        dst: PathBuf,
-    },
-    CopyChain {
-        src: PathBuf,
-        mid: PathBuf,
-        dst: PathBuf,
-    },
-    Mkdir {
-        paths: Vec<PathBuf>,
-        parents: bool,
-    },
-    Touch {
-        paths: Vec<PathBuf>,
-    },
-    Remove {
-        paths: Vec<PathBuf>,
-        force: bool,
-    },
-    Move {
-        src: PathBuf,
-        dst: PathBuf,
-    },
-    External,
+/// A command's typed behavior. Implementations live alongside their argument
+/// grammar; graph algorithms consume JobRecord data, never concrete job kinds.
+/// Registration supplies the object-safe adapter for this intentionally typed API.
+pub trait Job: Debug + Serialize + DeserializeOwned + Send + Sync + 'static {
+    const TYPE: &'static str;
+    const VERSION: u32 = 1;
+    fn patterns() -> Vec<String> {
+        Vec::new()
+    }
+    fn parse(shell: &ShellCommand) -> Result<Self>;
+    fn kind(&self) -> &str {
+        Self::TYPE
+    }
+    fn inputs(&self) -> impl Iterator<Item = &Path>;
+    fn outputs(&self) -> impl Iterator<Item = &Path>;
+    fn strategy(&self) -> ExecutionStrategy {
+        ExecutionStrategy::External
+    }
+    fn unknown_effects(&self) -> bool {
+        false
+    }
+    fn cacheable(&self) -> bool {
+        false
+    }
+    fn creates_parents(&self) -> bool {
+        false
+    }
+    fn refine_effects(&self, _spec: &mut JobSpec, _cwd: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn validate(&self, _record: &JobRecord, _cwd: &Path) -> Result<()> {
+        Ok(())
+    }
+    fn execute(&self, context: &ExecutionContext<'_>) -> Result<()>;
+    fn execute_batch(items: &[BatchItem<'_, Self>], context: &BatchContext<'_>) -> BatchReport {
+        context.run_each(items, |job, execution| job.execute(execution))
+    }
 }
 
+/// Persistent data, including conservative graph-policy overlays. `parsed` is
+/// the serialized typed job payload, not a lossy argv reconstruction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSpec {
+    pub type_tag: String,
+    pub handler_version: u32,
     pub kind: String,
-    pub operation: Operation,
     pub inputs: Vec<PathBuf>,
     pub outputs: Vec<PathBuf>,
     pub unknown_effects: bool,
     pub cacheable: bool,
+    pub creates_parents: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_reason: Option<String>,
     pub parsed: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct JobRecord {
+    pub source: SourceCommand,
+    pub shell: Option<ShellCommand>,
+    pub spec: JobSpec,
+    pub strategy: ExecutionStrategy,
+    #[serde(skip)]
+    command: Arc<dyn ErasedJob>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Job {
+pub struct JobSnapshot {
     pub source: SourceCommand,
     pub shell: Option<ShellCommand>,
     pub spec: JobSpec,
     pub strategy: ExecutionStrategy,
 }
 
-fn absolute(cwd: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    }
-}
-
-/// External jobs always execute the original text, never reconstructed argv.
-pub fn execute(job: &Job, cwd: &Path) -> Result<()> {
-    crate::binutils::validate_runtime(job, cwd)?;
-    // Native handlers cannot silently discard redirection. Classification normally
-    // turns these into barriers, but retain this guard for public/custom jobs.
-    let redirected = job
-        .shell
-        .as_ref()
-        .is_some_and(|s| s.stdin.is_some() || s.stdout.is_some() || s.stderr.is_some());
-    if job.strategy == ExecutionStrategy::External || redirected {
-        return external(job, cwd);
-    }
-    if matches!(
-        job.spec.operation,
-        Operation::Copy { .. }
-            | Operation::CopyChain { .. }
-            | Operation::Mkdir { .. }
-            | Operation::Touch { .. }
-    ) {
-        // Opaque earlier jobs may create aliases after graph construction.
-        // Refuse symlink components at runtime rather than trust stale paths.
-        for path in job.spec.inputs.iter().chain(&job.spec.outputs) {
-            let path = absolute(cwd, path);
-            for ancestor in path.ancestors() {
-                if fs::symlink_metadata(ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
-                    bail!(
-                        "native operation does not support symlink path components: {}",
-                        ancestor.display()
-                    );
-                }
-            }
+impl JobRecord {
+    pub fn new<T: Job>(
+        source: SourceCommand,
+        shell: Option<ShellCommand>,
+        command: T,
+    ) -> Result<Self> {
+        if T::TYPE.is_empty() {
+            bail!("job type tag must not be empty");
         }
+        let spec = JobSpec {
+            type_tag: T::TYPE.into(),
+            handler_version: T::VERSION,
+            kind: command.kind().into(),
+            inputs: command.inputs().map(Path::to_path_buf).collect(),
+            outputs: command.outputs().map(Path::to_path_buf).collect(),
+            unknown_effects: command.unknown_effects(),
+            cacheable: command.cacheable(),
+            creates_parents: command.creates_parents(),
+            effect_reason: None,
+            parsed: serde_json::to_value(&command)?,
+        };
+        let mut record = Self {
+            source,
+            shell,
+            strategy: command.strategy(),
+            spec,
+            command: Arc::new(command),
+        };
+        record.apply_redirections();
+        Ok(record)
     }
-    match &job.spec.operation {
-        Operation::Copy { src, dst } => copy_file(&absolute(cwd, src), &absolute(cwd, dst)),
-        Operation::CopyChain { src, mid, dst } => copy_chain(
-            &absolute(cwd, src),
-            &absolute(cwd, mid),
-            &absolute(cwd, dst),
-        ),
-        Operation::Mkdir { paths, parents } => {
-            for path in paths {
-                let path = absolute(cwd, path);
-                if *parents {
-                    mkdir_parents(&path)?;
-                } else {
-                    fs::create_dir(&path).with_context(|| format!("mkdir {}", path.display()))?;
-                }
-            }
-            Ok(())
-        }
-        Operation::Touch { paths } => {
-            for path in paths {
-                touch(&absolute(cwd, path))?;
-            }
-            Ok(())
-        }
-        Operation::Remove { paths, force } => {
-            for path in paths {
-                let path = absolute(cwd, path);
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if *force && error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| format!("rm {}", path.display()));
-                    }
-                }
-            }
-            Ok(())
-        }
-        Operation::Move { src, dst } => move_file(&absolute(cwd, src), &absolute(cwd, dst)),
-        Operation::External => external(job, cwd),
+    pub fn typed<T: Job>(&self) -> Option<&T> {
+        self.command.as_any().downcast_ref()
     }
-}
-
-fn external(job: &Job, cwd: &Path) -> Result<()> {
-    let status = Command::new("bash")
-        .args(["--noprofile", "--norc", "-c"])
-        .arg(&job.source.text)
-        .env_remove("BASH_ENV")
-        .env_remove("ENV")
-        .current_dir(cwd)
-        .status()
-        .context("starting bash for original command")?;
-    if !status.success() {
-        bail!(
-            "command on line {} failed ({status}): {}",
-            job.source.line,
-            job.source.text
-        );
+    pub fn replace<T: Job>(&mut self, command: T) -> Result<()> {
+        let replacement = Self::new(self.source.clone(), self.shell.clone(), command)?;
+        *self = replacement;
+        Ok(())
     }
-    Ok(())
-}
-
-fn checked_regular(path: &Path) -> Result<fs::Metadata> {
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!(
-            "native file operation requires a regular non-symlink file: {}",
-            path.display()
-        );
+    pub fn refine_effects(&mut self, cwd: &Path) -> Result<()> {
+        self.command.refine_effects(&mut self.spec, cwd)
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o7000 != 0 {
+    pub(crate) fn restore<T: Job>(snapshot: JobSnapshot) -> Result<Self> {
+        if snapshot.spec.type_tag != T::TYPE || snapshot.spec.handler_version != T::VERSION {
             bail!(
-                "native file operation does not support special permission bits: {}",
-                path.display()
+                "job handler/version mismatch for {}",
+                snapshot.spec.type_tag
             );
         }
-    }
-    Ok(metadata)
-}
-
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (a, b);
-        false
-    }
-}
-
-fn destination_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => checked_regular(path).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
-    }
-}
-
-/// GNU cp's ordinary file subset: existing destination mode is retained, while
-/// a new file uses source permissions filtered by the process umask.
-fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    let source_meta = checked_regular(src)?;
-    let destination_meta = destination_metadata(dst)?;
-    if destination_meta.as_ref().is_some_and(|m| !singleton(m)) {
-        bail!(
-            "native cp does not overwrite multiply-linked destinations: {}",
-            dst.display()
-        );
-    }
-    if destination_meta
-        .as_ref()
-        .is_some_and(|m| same_file(&source_meta, m))
-    {
-        bail!(
-            "cp source and destination are the same file: {} and {}",
-            src.display(),
-            dst.display()
-        );
-    }
-    let mut source = File::open(src).with_context(|| format!("opening {}", src.display()))?;
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if destination_meta.is_some() {
-        options.create(false);
-    } else {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(source_meta.permissions().mode() & 0o777);
-    }
-    let mut destination = options
-        .open(dst)
-        .with_context(|| format!("opening {}", dst.display()))?;
-    // Check the opened descriptors again before any truncation.
-    if same_file(&source.metadata()?, &destination.metadata()?) {
-        bail!("cp source and destination refer to the same file");
-    }
-    destination.set_len(0)?;
-    io::copy(&mut source, &mut destination)
-        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
-    Ok(())
-}
-
-fn singleton(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink() == 1
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
-}
-
-fn missing(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
-}
-
-fn copy_chain(src: &Path, mid: &Path, dst: &Path) -> Result<()> {
-    let streamable = checked_regular(src).is_ok_and(|m| singleton(&m))
-        && missing(mid)
-        && missing(dst)
-        && src != mid
-        && src != dst
-        && mid != dst
-        && distinct_locations(mid, dst);
-    if !streamable {
-        // Preserve the original sequence and its ordering/failure behavior.
-        copy_file(src, mid)?;
-        return copy_file(mid, dst);
-    }
-    let metadata = checked_regular(src)?;
-    let mut source = File::open(src)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(metadata.permissions().mode() & 0o777);
-    }
-    let mut intermediate = options
-        .open(mid)
-        .with_context(|| format!("creating {}", mid.display()))?;
-    if let Err(error) = File::open(mid) {
-        io::copy(&mut source, &mut intermediate)?;
-        return Err(error).with_context(|| format!("opening {} for second copy", mid.display()));
-    }
-    // If creation of the second destination fails, still finish the original
-    // first copy before returning its second-copy error.
-    let mut final_file = match options.open(dst) {
-        Ok(file) => file,
-        Err(error) => {
-            io::copy(&mut source, &mut intermediate)?;
-            return Err(error).with_context(|| format!("creating {}", dst.display()));
+        let command = T::deserialize(&snapshot.spec.parsed)
+            .with_context(|| format!("decode typed job {}", T::TYPE))?;
+        if snapshot.spec.kind != command.kind() {
+            bail!("job kind is inconsistent with typed payload {}", T::TYPE);
         }
-    };
-    let mut buffer = [0u8; 64 * 1024];
-    let mut second_error = None;
-    loop {
-        let length = match source.read(&mut buffer) {
-            Ok(length) => length,
-            Err(error) => {
-                drop(final_file);
-                fs::remove_file(dst).context("removing uncommitted second copy")?;
-                return Err(error).context("reading first copy");
-            }
+        let redirected = has_redirects(snapshot.shell.as_ref());
+        let replaces_effects = redirected
+            && (command.strategy() != ExecutionStrategy::External || command.unknown_effects());
+        let expected_strategy = if redirected {
+            ExecutionStrategy::External
+        } else {
+            command.strategy()
         };
-        if length == 0 {
-            break;
+        if snapshot.strategy != expected_strategy {
+            bail!(
+                "execution strategy is inconsistent with typed payload {}",
+                T::TYPE
+            );
         }
-        if let Err(error) = intermediate.write_all(&buffer[..length]) {
-            drop(final_file);
-            fs::remove_file(dst).context("removing uncommitted second copy")?;
-            return Err(error).context("writing first copy");
+        if (command.unknown_effects() || replaces_effects) && !snapshot.spec.unknown_effects {
+            bail!(
+                "snapshot cannot remove intrinsic unknown effects for {}",
+                T::TYPE
+            );
         }
-        if second_error.is_none() {
-            if let Err(error) = final_file.write_all(&buffer[..length]) {
-                second_error = Some(error);
+        if snapshot.spec.cacheable && (!command.cacheable() || redirected) {
+            bail!("snapshot cannot enable unsafe caching for {}", T::TYPE);
+        }
+        if !replaces_effects {
+            if command
+                .inputs()
+                .any(|p| !snapshot.spec.inputs.iter().any(|stored| stored == p))
+                || command
+                    .outputs()
+                    .any(|p| !snapshot.spec.outputs.iter().any(|stored| stored == p))
+            {
+                bail!("snapshot omits intrinsic file effects for {}", T::TYPE);
             }
-        }
-    }
-    if let Some(error) = second_error {
-        return Err(error).context("writing second copy");
-    }
-    Ok(())
-}
-
-fn distinct_locations(a: &Path, b: &Path) -> bool {
-    match (
-        a.parent().and_then(|p| p.canonicalize().ok()),
-        b.parent().and_then(|p| p.canonicalize().ok()),
-    ) {
-        (Some(ap), Some(bp)) => {
-            ap.join(a.file_name().unwrap_or_default()) != bp.join(b.file_name().unwrap_or_default())
-        }
-        _ => false,
-    }
-}
-
-fn mkdir_parents(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    let components: Vec<_> = path.components().collect();
-    for (index, component) in components.iter().enumerate() {
-        current.push(component.as_os_str());
-        match fs::create_dir(&current) {
-            Ok(()) => {
-                // GNU mkdir -p gives newly created intermediate directories
-                // owner write/search even when umask removes those bits.
-                #[cfg(unix)]
-                if index + 1 < components.len() {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = fs::metadata(&current)?.permissions().mode();
-                    fs::set_permissions(&current, fs::Permissions::from_mode(mode | 0o300))?;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && current.is_dir() => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("mkdir -p {}", current.display()));
-            }
-        }
-    }
-    if components.is_empty() {
-        bail!("mkdir: empty path");
-    }
-    Ok(())
-}
-
-fn touch(path: &Path) -> Result<()> {
-    let file = match fs::symlink_metadata(path) {
-        Ok(_) => {
-            if !singleton(&checked_regular(path)?) {
+            if command.creates_parents() && !snapshot.spec.creates_parents {
                 bail!(
-                    "native touch does not support multiply-linked files: {}",
-                    path.display()
+                    "snapshot omits intrinsic parent-directory effects for {}",
+                    T::TYPE
                 );
             }
-            File::open(path).with_context(|| format!("opening {} for touch", path.display()))?
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            OpenOptions::new().write(true).create_new(true).open(path)?
+        if let Some(shell) = &snapshot.shell {
+            if shell
+                .stdin
+                .iter()
+                .chain(shell.stdout.iter().filter(|_| shell.append_stdout))
+                .any(|path| !snapshot.spec.inputs.contains(path))
+                || shell
+                    .stdout
+                    .iter()
+                    .chain(shell.stderr.iter())
+                    .any(|path| !snapshot.spec.outputs.contains(path))
+            {
+                bail!("snapshot omits shell redirection effects for {}", T::TYPE);
+            }
         }
-        Err(error) => return Err(error.into()),
-    };
-    let now = std::time::SystemTime::now();
-    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
-    Ok(())
+        Ok(Self {
+            source: snapshot.source,
+            shell: snapshot.shell,
+            spec: snapshot.spec,
+            strategy: snapshot.strategy,
+            command: Arc::new(command),
+        })
+    }
+    fn apply_redirections(&mut self) {
+        let Some(shell) = &self.shell else {
+            return;
+        };
+        if !has_redirects(Some(shell)) {
+            return;
+        }
+        let precise_external =
+            self.strategy == ExecutionStrategy::External && !self.spec.unknown_effects;
+        self.strategy = ExecutionStrategy::External;
+        if !precise_external {
+            self.spec.inputs.clear();
+            self.spec.outputs.clear();
+            self.spec.unknown_effects = true;
+            self.spec.creates_parents = false;
+        }
+        if let Some(path) = &shell.stdin {
+            self.spec.inputs.push(path.clone());
+        }
+        if let Some(path) = &shell.stdout {
+            self.spec.outputs.push(path.clone());
+            if shell.append_stdout {
+                self.spec.inputs.push(path.clone());
+            }
+        }
+        if let Some(path) = &shell.stderr {
+            self.spec.outputs.push(path.clone());
+        }
+        self.spec.cacheable = false;
+    }
 }
 
-fn move_file(src: &Path, dst: &Path) -> Result<()> {
-    let source = checked_regular(src)?;
-    if let Some(destination) = destination_metadata(dst)? {
-        if same_file(&source, &destination) {
-            bail!("mv source and destination are the same file");
+pub fn has_redirects(shell: Option<&ShellCommand>) -> bool {
+    shell.is_some_and(|s| s.stdin.is_some() || s.stdout.is_some() || s.stderr.is_some())
+}
+
+pub struct ExecutionContext<'a> {
+    pub cwd: &'a Path,
+    pub record: &'a JobRecord,
+}
+impl ExecutionContext<'_> {
+    pub fn absolute(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_owned()
+        } else {
+            self.cwd.join(path)
         }
     }
-    // Cross-device moves require metadata and cleanup semantics beyond this
-    // narrow subset. rename reports EXDEV before mutating either location.
-    fs::rename(src, dst).with_context(|| {
-        format!(
-            "mv {} to {} (cross-device moves unsupported)",
-            src.display(),
-            dst.display()
-        )
-    })?;
-    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_overwrites_without_changing_destination_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let dst = dir.path().join("dst");
-        fs::write(&src, "new").unwrap();
-        fs::write(&dst, "old contents").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dst, fs::Permissions::from_mode(0o600)).unwrap();
+pub struct BatchItem<'a, T: Job> {
+    pub id: usize,
+    pub job: &'a T,
+    pub record: &'a JobRecord,
+}
+pub struct BatchContext<'a> {
+    pub cwd: &'a Path,
+    pub cancelled: &'a AtomicBool,
+}
+#[derive(Default, Debug)]
+pub struct BatchReport {
+    pub outcomes: Vec<(usize, Result<()>)>,
+}
+impl BatchReport {
+    fn failed(id: usize, error: anyhow::Error) -> Self {
+        Self {
+            outcomes: vec![(id, Err(error))],
         }
-        copy_file(&src, &dst).unwrap();
-        assert_eq!(fs::read(&dst).unwrap(), b"new");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(dst).unwrap().permissions().mode() & 0o777,
-                0o600
+    }
+}
+impl BatchContext<'_> {
+    pub fn run_each<T: Job, F>(&self, items: &[BatchItem<'_, T>], mut execute: F) -> BatchReport
+    where
+        F: FnMut(&T, &ExecutionContext<'_>) -> Result<()>,
+    {
+        let mut report = BatchReport {
+            outcomes: Vec::with_capacity(items.len()),
+        };
+        for item in items {
+            if self.cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            let context = ExecutionContext {
+                cwd: self.cwd,
+                record: item.record,
+            };
+            let result = if item.record.strategy == ExecutionStrategy::External
+                && item.job.strategy() != ExecutionStrategy::External
+            {
+                crate::commands::external::execute_original(&context)
+            } else {
+                item.job
+                    .validate(item.record, self.cwd)
+                    .and_then(|()| execute(item.job, &context))
+            };
+            if result.is_err() {
+                self.cancelled.store(true, Ordering::Release);
+            }
+            report.outcomes.push((item.id, result));
+        }
+        report
+    }
+}
+
+trait ErasedJob: Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn refine_effects(&self, spec: &mut JobSpec, cwd: &Path) -> Result<()>;
+    fn execute_batch(
+        &self,
+        records: &[JobRecord],
+        ids: &[usize],
+        context: &BatchContext<'_>,
+    ) -> BatchReport;
+}
+impl<T: Job> ErasedJob for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn refine_effects(&self, spec: &mut JobSpec, cwd: &Path) -> Result<()> {
+        Job::refine_effects(self, spec, cwd)
+    }
+    fn execute_batch(
+        &self,
+        records: &[JobRecord],
+        ids: &[usize],
+        context: &BatchContext<'_>,
+    ) -> BatchReport {
+        let mut items = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(record) = records.get(id) else {
+                context.cancelled.store(true, Ordering::Release);
+                return BatchReport::failed(
+                    id,
+                    anyhow::anyhow!("batch contains invalid node {id}"),
+                );
+            };
+            let Some(job) = record.typed::<T>() else {
+                context.cancelled.store(true, Ordering::Release);
+                return BatchReport::failed(
+                    id,
+                    anyhow::anyhow!("heterogeneous typed batch for {}", T::TYPE),
+                );
+            };
+            items.push(BatchItem { id, job, record });
+        }
+        let report = T::execute_batch(&items, context);
+        validate_report(ids, report, context)
+    }
+}
+
+/// Called once per concrete-type/identity/strategy group, with ascending node IDs.
+/// No operation match or tool-name special case exists in the scheduler.
+pub fn execute_batch(
+    records: &[JobRecord],
+    ids: &[usize],
+    context: &BatchContext<'_>,
+) -> BatchReport {
+    let Some(&id) = ids.first() else {
+        return BatchReport::default();
+    };
+    if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        context.cancelled.store(true, Ordering::Release);
+        return BatchReport::failed(
+            id,
+            anyhow::anyhow!("batch node IDs must be unique and ordered"),
+        );
+    }
+    let Some(first) = records.get(id) else {
+        context.cancelled.store(true, Ordering::Release);
+        return BatchReport::failed(id, anyhow::anyhow!("batch contains invalid node {id}"));
+    };
+    first.command.execute_batch(records, ids, context)
+}
+
+fn validate_report(ids: &[usize], report: BatchReport, context: &BatchContext<'_>) -> BatchReport {
+    let mut seen = vec![false; ids.len()];
+    let mut failed = false;
+    for (id, result) in &report.outcomes {
+        let index = match ids.binary_search(id) {
+            Ok(index) if !seen[index] => index,
+            _ => {
+                context.cancelled.store(true, Ordering::Release);
+                return BatchReport::failed(
+                    ids[0],
+                    anyhow::anyhow!("batch handler reported an unknown or duplicate node {id}"),
+                );
+            }
+        };
+        seen[index] = true;
+        failed |= result.is_err();
+    }
+    if failed {
+        context.cancelled.store(true, Ordering::Release);
+    }
+    if !failed && !context.cancelled.load(Ordering::Acquire) {
+        if let Some(missing) = seen.iter().position(|&present| !present) {
+            context.cancelled.store(true, Ordering::Release);
+            return BatchReport::failed(
+                ids[missing],
+                anyhow::anyhow!("batch handler omitted a result for node {}", ids[missing]),
             );
         }
     }
-
-    #[cfg(unix)]
-    #[test]
-    fn copy_rejects_aliases_and_symlinks_without_truncation() {
-        use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let alias = dir.path().join("alias");
-        let link = dir.path().join("link");
-        fs::write(&src, "original").unwrap();
-        fs::hard_link(&src, &alias).unwrap();
-        symlink(&src, &link).unwrap();
-        assert!(copy_file(&src, &alias).is_err());
-        assert!(copy_file(&src, &link).is_err());
-        assert_eq!(fs::read(src).unwrap(), b"original");
-    }
-
-    #[test]
-    fn chain_keeps_both_outputs_and_falls_back_for_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        let mid = dir.path().join("mid");
-        let dst = dir.path().join("dst");
-        fs::write(&src, vec![42; 200_000]).unwrap();
-        copy_chain(&src, &mid, &dst).unwrap();
-        assert_eq!(fs::read(&mid).unwrap(), fs::read(&dst).unwrap());
-        fs::write(&src, "replacement").unwrap();
-        copy_chain(&src, &mid, &dst).unwrap();
-        assert_eq!(fs::read(&mid).unwrap(), b"replacement");
-        assert_eq!(fs::read(&dst).unwrap(), b"replacement");
-    }
-
-    #[test]
-    fn mkdir_parent_subset() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a/b");
-        mkdir_parents(&path).unwrap();
-        mkdir_parents(&path).unwrap();
-        assert!(path.is_dir());
-        assert!(copy_file(dir.path(), &dir.path().join("file")).is_err());
-    }
-
-    #[test]
-    fn native_touch_move_and_force_remove() {
-        let dir = tempfile::tempdir().unwrap();
-        let run = |operation| {
-            execute(
-                &Job {
-                    source: SourceCommand {
-                        line: 1,
-                        text: String::new(),
-                        target: None,
-                    },
-                    shell: None,
-                    spec: JobSpec {
-                        kind: "test".into(),
-                        operation,
-                        inputs: vec![],
-                        outputs: vec![],
-                        unknown_effects: true,
-                        cacheable: false,
-                        parsed: serde_json::json!({}),
-                    },
-                    strategy: ExecutionStrategy::Internal,
-                },
-                dir.path(),
-            )
-        };
-        run(Operation::Touch {
-            paths: vec!["a".into()],
-        })
-        .unwrap();
-        assert!(dir.path().join("a").is_file());
-        fs::write(dir.path().join("a"), "payload").unwrap();
-        run(Operation::Move {
-            src: "a".into(),
-            dst: "b".into(),
-        })
-        .unwrap();
-        assert!(!dir.path().join("a").exists());
-        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"payload");
-        run(Operation::Remove {
-            paths: vec!["b".into()],
-            force: false,
-        })
-        .unwrap();
-        run(Operation::Remove {
-            paths: vec!["b".into()],
-            force: true,
-        })
-        .unwrap();
-        assert!(
-            run(Operation::Remove {
-                paths: vec!["b".into()],
-                force: false
-            })
-            .is_err()
-        );
-    }
+    report
 }

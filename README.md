@@ -36,6 +36,7 @@ human-readable waves to stdout; JSON is written only to the requested file.
 | `--dump-plan FILE` | JSON: jobs, parsed metadata, edges, waves, versions, rewrite provenance |
 | `--compile-commands FILE` | Compilation database using argv arrays, including in dry-run |
 | `--python-script ID=PATH` | Repeatable exact script-specific registration |
+| `--compiler-regex REGEX` | Repeatable replacement compiler matchers; executable spelling and argv stay unchanged |
 | `--generated-header-source REGEX` | Repeatable opt-in source predicate for generated-header prerequisites |
 | `--explain`, `--verbose` | Classifications, barriers, edges, rewrites, cache reasons, batches, results |
 | `--dry-run` | Validate/export/display without executing jobs or writing the cache |
@@ -70,9 +71,10 @@ runnable from the repository root:
 cargo run --example python_generated_headers
 ```
 
-It registers a clap-based parser for
-[`tools/generate_header.py`](fixtures/python_headers/tools/generate_header.py),
-declares the script/template inputs and generated-header output, and runs a real
+It registers [`GenerateHeadersPy`](src/commands/generate_headers_py.rs), whose
+clap parser and `Job` implementation own the contract for
+[`tools/generate_header.py`](fixtures/python_headers/tools/generate_header.py).
+The job declares script/template inputs and the generated-header output, then runs a real
 Python generator plus C compiler in an isolated temporary directory. The fixture
 deliberately lists the compiler **before** its generator. The header policy adds
 the prerequisite, so Python runs first; the application prints
@@ -80,8 +82,8 @@ the prerequisite, so Python runs first; the application prints
 
 This is an example of a trusted script-specific effect contract, not inference
 of arbitrary Python behavior. `--python-script ID=PATH` alone only classifies the
-script and remains opaque; precise effects require a registered parser such as
-the example's `parse_generator`. Do not register both matchers for the same
+script and remains opaque; precise effects require a trusted typed job registered
+with `registry.register::<GenerateHeadersPy>()?`. Do not register both matchers for the same
 command: ambiguity remains fatal.
 
 
@@ -148,16 +150,15 @@ flowchart LR
   counts**, including overlaps within one handler; there are no priorities or
   specificity rules. Exactly one match dispatches the typed parser; rejection is
   fatal. Valid complex syntax remains original-text external work with a barrier.
-* `commands.rs`, `job.rs`: clap-derived argument structures and an enum of native
-  operations. The enum is the simple type-erased, serializable job representation;
-  string identities distinguish configured Python scripts without changing the
-  scheduler. Identity and execution strategy are separate. `External`, `Internal`
-  and `Batched` strategies are represented; this PoC does not fabricate subprocess
-  batching for compilers. Original argv/text and parsed flags are preserved.
-* `binutils.rs`, `binutils/inspection.rs`, `binutils/mutation.rs`: declarative
-  option subsets infer tool inputs/outputs independently of process execution.
-  Known effects become ordinary DAG nodes; uncertain modes retain a diagnosed
-  passthrough barrier. File redirection alone does not force a barrier.
+* `job.rs`: the public typed `Job` trait owns parsing, declared effects, validation,
+  execution and batch behavior. `JobRecord` combines a serializable `JobSpec` with
+  private erased runtime behavior; there is no central operation enum.
+* `commands/`: each command has its own module, including `cp.rs`,
+  `generate_headers_py.rs`, `compiler.rs`, `nm.rs`, `ar.rs` and the other binary
+  tools. `commands/mod.rs` only composes registrations. Shared filesystem and
+  binary-effect helpers contain no kind-to-executor dispatcher.
+  Understood external tools become ordinary DAG nodes; uncertain modes retain a
+  diagnosed passthrough barrier. File redirection alone does not force a barrier.
 * `graph.rs`: original-order RAW, WAW and WAR edges; ancestor/descendant path
   conflicts conservatively order directory operations. `mkdir -p` includes
   implicit parent effects, including prerequisites for sibling outputs.
@@ -168,11 +169,11 @@ flowchart LR
   barriers. POSIX backslashes are never normalized into separators. Logical
   `path@version` reads and writes aid inspection; files are not snapshotted, so
   WAR edges protect readers from later overwrites. Kahn sorting reports cycles.
-* `scheduler.rs`: deterministic waves, then compatible identity/strategy groups.
-  Each group is one dispatch; members of the same group currently execute
-  sequentially. Different groups can run concurrently up to `--jobs`, including
-  precise external binary-tool jobs. Native groups avoid subprocesses. Compiler
-  and opaque jobs retain conservative ordering except for explicit selected
+* `scheduler.rs`: deterministic waves, then concrete-type/kind/strategy groups.
+  Each group invokes its typed batch override once through an erased adapter.
+  The default batch loop executes members sequentially; handlers can override it.
+  Different groups can run concurrently up to `--jobs`. Native groups avoid subprocesses.
+  Compiler and opaque jobs retain conservative ordering except for explicit selected
   generated-header prerequisites. First failure cancels not-yet-started work;
   already-running independent
   work finishes, no dependent wave starts, and the process exits nonzero.
@@ -182,27 +183,65 @@ flowchart LR
   new output files it reads A once and writes both outputs with a bounded 64 KiB
   buffer. Existing/aliased/unsupported paths fall back to the original two-copy
   sequence. Source overwrite patterns are rejected; all original jobs remain in
-  `provenance`. Future fusion/compile batching/jumbo passes can implement the same
-  trait; none are advertised as implemented.
+  `provenance`. The opt-in unity example demonstrates a separate compiler graph
+  transform; it is not enabled by normal CLI optimization.
 
 The graph uses pairwise hazard comparisons (quadratic in command count), not a
 fully sequential chain. This favors a small, auditable implementation over a
 premature indexed dependency engine. No throughput/speedup benchmark is claimed.
 
-### Why job behavior is not a trait yet
+### Runtime behavior and persistent plans
 
-The PoC stores serializable `Job`/`JobSpec` records and uses an `Operation` enum
-for native execution. That keeps fingerprints, JSON, provenance and rewrite
-matching simple, but adding native behavior still requires editing the enum and
-executor dispatch. Parser callbacks already allow additional external tools
-without scheduler changes. File-per-command modules are possible with either
-representation; they do not require a trait.
+`Job` is deliberately a typed trait, not an object-safe interface. Registration
+creates a private erased adapter that downcasts a compatible group and calls
+`T::execute_batch`. This supports real typed overrides without editing the
+scheduler or trying to call a static method through `dyn Job`.
 
-For further native extensibility, the preferred direction is serializable records
-plus trait-based command implementations and typed registration with an erased
-batch dispatcher. A static `execute_batch(&[Self]) where Self: Sized` cannot be
-called through `dyn Job`, so a heterogeneous trait-object vector alone does not
-solve batching. That behavior-layer refactor is **not implemented** in this PoC.
+`JobRecord.source` and `shell` retain original text, line, target and shell syntax.
+`spec.parsed` is the serialized typed payload. Graph policies may add conservative
+inputs/outputs and `spec.effect_reason` without changing that payload. Replacing a
+typed command uses `record.replace(new_job)?`; transforms must explicitly retain
+any policy-added effects and original provenance.
+
+Serialize a graph with `serde_json::to_vec(&graph)?`. Restore it with
+`BuildGraph::from_json(&bytes, &registry)?`, after registering every implementation
+used by executable nodes **and provenance**. Stable `Job::TYPE` tags identify
+decoders; `Job::VERSION` rejects incompatible payload versions. Missing decoders,
+incompatible versions and invalid graph constraints fail before a runnable graph
+is returned. There is no generic `Deserialize` implementation or no-op fallback.
+
+### Opt-in unity transform
+
+```sh
+cargo run --example unity_build
+```
+
+[`examples/support/unity_transform.rs`](examples/support/unity_transform.rs)
+groups `.c` basenames by their stem component before `_`: `calc_add.c` and
+`calc_mul.c` merge, while singleton `main.c` stays separate. Groups require one
+compile-only C source and one explicit `.o` output per command, static shell
+words, complete metadata, and exactly equal compiler executable and argument
+order after removing only the source and separate `-o OUTPUT`.
+
+A registered internal `UnitySource` job generates one translation unit; one
+compiler produces one unity object. Every modeled pure-object link consumer
+replaces all group objects with that object exactly once. Original object files
+are **not** fabricated. Original compilation commands remain in provenance and
+compilation-database exports. Planning and rejection do not write generated files;
+the graph is replaced only after validation succeeds.
+
+The runnable example compares isolated standalone/unity builds and checks the
+application output, compiler invocation count and absence of old object outputs.
+Its scope is intentionally conservative: opaque commands, unknown compiler flags,
+response files, redirects, partial/unmodeled object consumers, generated source
+inputs and required dependencies touching grouped commands reject the transform.
+It also refuses to move grouped compilation across file-producing non-compiler
+commands that could change implicit headers. Unrelated required dependencies survive.
+
+Identical flags do **not** prove unity compatibility: static identifiers, macros,
+pragmas, include ordering and `__FILE__` can change C behavior. Source selection
+and compatibility remain the caller's responsibility. This example is opt-in,
+not a default optimization or a claim of arbitrary C source equivalence.
 
 
 ## Supported command subsets
@@ -238,6 +277,29 @@ from compilation database entries rather than invented. Default output filenames
 are not inferred when unknown arguments could change the compiler's mode;
 explicit `-o` metadata is retained. Missing values for recognized flags remain
 parsing errors. `--explain` reports partial metadata and preserved arguments.
+
+### Arbitrary compiler executable names
+
+Compiler parsing does not require a GCC/Clang basename. Default matchers recognize
+common names for convenience; configure the compiler **role** explicitly for
+other names, including quoted paths with spaces:
+
+```sh
+rusty_make --commands commands.txt \
+  --compiler-regex "^'./tool chain/odd-driver'(?:\\s|$)" \
+  --compile-commands compile_commands.json
+```
+
+Each repeatable `--compiler-regex` matches original command text and replaces only
+the compiler matchers. Other roles remain registered; overlaps with them, or
+between two custom compiler patterns, are fatal. Invalid patterns fail before
+Make planning or execution. The executable spelling in `argv[0]` is neither
+rewritten nor interpreted as a required compiler name. An unconfigured tool is
+not guessed to be a compiler merely because it accepts `-o`.
+
+Library callers can use `registry.replace_patterns::<Compiler>(&patterns)?` or
+`registry.register_with::<Compiler, _>(classification, &patterns, Compiler::parse)?`.
+`Compiler::from_argv(argv)?` is also name-agnostic for graph transforms.
 
 Binary tools are registered for `nm`, `objdump`, `readelf`, `size`, `strings`,
 `addr2line`, `c++filt`, `objcopy`, `strip`, `ar`, `ranlib`, `as`, `ld`, `elfedit`
@@ -368,13 +430,14 @@ JSON retains them in `required_dependencies`.
 ## Incremental builds
 
 `.rusty_make/cache.json` stores schema/version, stable source position/target,
-command/parsed-operation fingerprints, cwd/environment fingerprints, and explicit
+command/typed-payload fingerprints, cwd/environment fingerprints, and explicit
 input/output BLAKE3 hashes plus permission bits. Files are rehashed every time:
 there is no size/mtime shortcut. Directories use an existence/mode marker, not a
 recursive hash (creating another child does not invalidate `mkdir -p`). Symlinks,
 special files and hardlink aliases do not produce safe cache hits.
 
-Only precisely modeled native copies/copy chains and mkdir jobs are cacheable.
+Built-in native copies/copy chains and mkdir jobs are cacheable; custom jobs may
+opt in only when their declared effects completely describe their dependencies.
 Touch is observable timestamp work and is always executed. Compiler headers,
 Python scripts, sed programs and unknown commands may hide arbitrary dependencies:
 these jobs and jobs with unknown-effect ancestors are not skipped. GCC `-MMD -MF`
@@ -429,15 +492,31 @@ arbitrary code from CLI configuration.
 
 ## Extending handlers
 
-1. Define clap-derived arguments and a `fn(&ShellCommand) -> anyhow::Result<JobSpec>`.
-2. Populate typed parsed metadata, exact file effects and cacheability. Default to
-   `unknown_effects: true`, `cacheable: false` if there is any uncertainty.
-3. Register one or more anchored regexes with `Registry::register`. Any overlap
-   remains fatal; parsers do not resolve ambiguity. `Registry::add_python` is the
-   supplied exact-script registration mechanism.
-4. Reuse `Operation::External` for metadata-attached fallback behavior, or add a
-   native enum variant and its execution branch. The scheduler needs no changes.
-5. Test classification, unsupported flags, semantics, hazards and real execution.
+1. Create a serializable `Debug + Send + Sync + 'static` command type implementing
+   `Job` in its own module. Keep its matcher, clap arguments, `parse`, `inputs`,
+   `outputs`, `validate`, `execute` and optional `execute_batch` together.
+2. Choose a unique stable `TYPE` and bump `VERSION` for incompatible persistence
+   changes. Declare every effect; return `unknown_effects() == true` whenever
+   effects are uncertain. Cacheability defaults to false.
+3. Register it with `registry.register::<MyJob>()?`. For configured parser
+   factories use `register_with::<MyJob, _>(classification, patterns, parser)?`;
+   for internal transform-only types use `register_type::<MyJob>()?`.
+4. Implement execution directly or use `commands::external::{execute_argv,
+   execute_original}` when external behavior is intended. No enum or scheduler
+   change is needed. See [`Cp`](src/commands/cp.rs) and
+   [`GenerateHeadersPy`](src/commands/generate_headers_py.rs) for complete examples.
+5. Test semantics, unsupported inputs, hazards, persisted restoration and actual
+   execution. The isolated custom jobs in `tests/job_traits.rs` exercise the public
+   extension and failure contracts.
+
+The default `execute_batch` calls `context.run_each(items, ...)`, which validates
+each member, handles native shell-redirection fallback, checks cancellation and
+reports outcomes individually. Overrides must preserve those obligations and
+report each completed node ID exactly once. Omitted results are accepted only
+after failure/cancellation; duplicate/unknown IDs or unexplained omissions fail.
+Only successful completed jobs gain cache records; no dependent wave runs after
+failure. Different concrete types never share a batch merely because `kind()`
+returns the same label.
 
 For another opaque binary tool, use
 `Registry::register_external("tool-name", &[r"^tool-name(?:\s|$)"])`. This preserves
@@ -464,15 +543,16 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **114 passed**, no failures, including real compiler, Python, sed,
+* `cargo test`: **186 passed**, no failures, including real compiler, Python, sed,
   Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
   database were written and inspected.
-* A standalone two-copy log executed once as a fused node, then executed **zero**
-  jobs on the identical second run. `--rebuild-all --no-optimize` executed both
-  original jobs. The real Make CLI smoke preserved expansion-generated files and
-  copied the planned output correctly.
+* Native cache CLI smoke: `mkdir -p` plus two copies became two nodes; the cold
+  run executed both, the identical second run executed **zero**, and
+  `--rebuild-all --no-optimize` executed all three original commands. Final bytes
+  matched the input. The real Make CLI smoke also preserved expansion-generated
+  files and copied the planned output correctly.
 * Compiler passthrough CLI smoke: joined/separated `-I` and `-L`, paths with
   spaces, and unknown-to-Rust flags (`-Wall`, `-Wextra`, `-std=c11`, `-lvalue`)
   compiled and linked against a generated static library; the application printed
@@ -482,11 +562,11 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   appended `nm` symbols and stdin-driven `c++filt` output (`foo()`); `as`/`ld`
   outputs retained the expected exported symbol. GNU inspection output was also
   compared byte-for-byte against direct tool execution in the regression suite.
-* Precise-effect CLI smoke: 11 commands completed in four waves, with six jobs
-  sharing one ready wave. Known `nm`/`objdump`/`readelf`/`objcopy`/archive effects
-  removed blanket serialization while strip/archive consumers kept their file
-  dependencies. Tests also cover multiple outputs, WAR hazards, append ordering,
-  unchanged-output propagation, and thin-archive fallback/replanning.
+* Post-refactor precise-effect CLI smoke: compile, `nm`, `objcopy`, and native
+  copy completed in three waves. `nm` and `objcopy` shared a ready wave; the copy
+  retained its object producer dependency. Exported plan, DOT and compilation
+  argv were inspected, the symbol report contained `trait_smoke_symbol`, and the
+  delivered object matched the compiler output byte-for-byte.
 * `cargo run --example python_generated_headers`: generated a header with Python,
   hoisted its known generator ahead of the compiler, and ran the application,
   which printed `generated answer: 42`.
@@ -494,6 +574,19 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   `-isystem generated`; a later copy ran first, the application printed `42`,
   and an unselected compiler did not gain the header input. This also exercised
   `--no-optimize --rebuild-all`, explain output and all plan/database exports.
+* Public extension regressions register local serializable jobs, execute their
+  typed batch overrides and restored graphs, and isolate concrete types sharing
+  one kind. Partial failure invalidates stale cache records, preserves completed
+  successes and stops dependents. Duplicate/unknown/omitted reports and cancellation
+  without an error outcome fail instead of silently advancing the graph.
+* Custom compiler CLI regressions compile/link through `./tool bin/odd driver`,
+  run the application, and verify exact argv and source identities across plan,
+  DOT and compilation-database exports. Overlapping/invalid patterns reject the
+  whole plan before prefix writes or Make planning side effects.
+* `cargo run --example unity_build`: **4 standalone -> 3 unity** compiler
+  invocations, identical `unity demo: 42 42` output, and no fabricated original
+  objects. Regressions cover multiple link consumers/groups, transactional
+  rejection, implicit-header mutation boundaries and retained link prerequisites.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings

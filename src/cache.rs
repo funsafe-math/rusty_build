@@ -1,4 +1,4 @@
-use crate::{graph::BuildGraph, job::Job};
+use crate::{graph::BuildGraph, job::JobRecord};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA: &str = "rusty-make-content-v1";
+const SCHEMA: &str = "rusty-make-trait-jobs-v2";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Record {
     fingerprint: String,
@@ -121,7 +121,7 @@ impl Cache {
             graph.jobs[i].source.target.as_deref().unwrap_or("")
         )
     }
-    fn fingerprint(&self, job: &Job, cwd: &Path) -> Result<String> {
+    fn fingerprint(&self, job: &JobRecord, cwd: &Path) -> Result<String> {
         Ok(blake3::hash(&serde_json::to_vec(&(
             SCHEMA,
             env!("CARGO_PKG_VERSION"),

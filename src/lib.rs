@@ -1,4 +1,3 @@
-mod binutils;
 pub mod cache;
 pub mod cli;
 pub mod commands;

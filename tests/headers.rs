@@ -323,8 +323,11 @@ fn cli_policy_runs_with_no_optimization_and_rebuild_all_and_executes_a_real_comp
     );
     assert!(Command::new(p.join("app")).status().unwrap().success());
     assert!(p.join("other.o").is_file());
-    let graph: BuildGraph =
-        serde_json::from_slice(&fs::read(p.join("graph.json")).unwrap()).unwrap();
+    let graph = BuildGraph::from_json(
+        &fs::read(p.join("graph.json")).unwrap(),
+        &Registry::default(),
+    )
+    .unwrap();
     assert_eq!(graph.jobs.len(), 3);
     assert_eq!(graph.required_dependencies.len(), 1);
     assert_eq!(

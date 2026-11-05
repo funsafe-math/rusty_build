@@ -66,7 +66,7 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
     let mut report = RunReport::default();
     let mut unvalidated = vec![false; graph.jobs.len()];
     for (wave_index, wave) in graph.topological_waves()?.iter().enumerate() {
-        let mut groups = BTreeMap::<String, Vec<usize>>::new();
+        let mut groups = BTreeMap::<(&str, &str, job::ExecutionStrategy), Vec<usize>>::new();
         for &id in wave {
             unvalidated[id] = graph
                 .edges
@@ -92,9 +92,10 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
                         eprintln!("[CACHE] miss node {id}: {reason}");
                     }
                     groups
-                        .entry(format!(
-                            "{}:{:?}",
-                            graph.jobs[id].spec.kind, graph.jobs[id].strategy
+                        .entry((
+                            graph.jobs[id].spec.type_tag.as_str(),
+                            graph.jobs[id].spec.kind.as_str(),
+                            graph.jobs[id].strategy,
                         ))
                         .or_default()
                         .push(id);
@@ -104,9 +105,11 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
         let groups: Vec<_> = groups.into_iter().collect();
         report.batches += groups.len();
         report.planned += groups.iter().map(|(_, ids)| ids.len()).sum::<usize>();
-        for (kind, ids) in &groups {
+        for ((type_tag, kind, strategy), ids) in &groups {
             if options.explain || options.dry_run {
-                eprintln!("[BATCH] wave {wave_index} {kind}: nodes {ids:?}");
+                eprintln!(
+                    "[BATCH] wave {wave_index} {kind}:{strategy:?} ({type_tag}): nodes {ids:?}"
+                );
             }
         }
         if options.dry_run {
@@ -136,24 +139,25 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
                         let Some((_, ids)) = groups.get(batch) else {
                             break;
                         };
-                        // One dispatch per compatible typed group. The enum is
-                        // the type-erased collection; adding types never changes scheduling.
-                        for &id in ids {
-                            if failed.load(Ordering::Acquire) {
-                                break;
-                            }
-                            let result =
-                                job::execute(&graph.jobs[id], &graph.cwd).with_context(|| {
-                                    format!(
-                                        "node {id}, input line {}: {}",
-                                        graph.jobs[id].source.line, graph.jobs[id].source.text
-                                    )
-                                });
-                            if result.is_err() {
-                                failed.store(true, Ordering::Release);
-                            }
-                            results.lock().unwrap().push((id, result));
-                        }
+                        let context = job::BatchContext {
+                            cwd: &graph.cwd,
+                            cancelled: failed,
+                        };
+                        let report = job::execute_batch(&graph.jobs, ids, &context);
+                        results
+                            .lock()
+                            .unwrap()
+                            .extend(report.outcomes.into_iter().map(|(id, result)| {
+                                (
+                                    id,
+                                    result.with_context(|| {
+                                        format!(
+                                            "node {id}, input line {}: {}",
+                                            graph.jobs[id].source.line, graph.jobs[id].source.text
+                                        )
+                                    }),
+                                )
+                            }));
                     }
                 });
             }
@@ -180,6 +184,9 @@ pub fn run(graph: &BuildGraph, options: &RunOptions) -> Result<RunReport> {
         cache.save()?;
         if let Some(error) = first_error {
             return Err(error);
+        }
+        if failed.load(Ordering::Acquire) {
+            bail!("batch execution cancelled without an error outcome");
         }
     }
     Ok(report)

@@ -28,6 +28,9 @@ pub struct Cli {
     pub dump_plan: Option<PathBuf>,
     #[arg(long, value_name = "FILE")]
     pub compile_commands: Option<PathBuf>,
+    /// Replace compiler classification patterns; execute argv[0] exactly as supplied.
+    #[arg(long, value_name = "REGEX")]
+    pub compiler_regex: Vec<String>,
     #[arg(long)]
     pub explain: bool,
     #[arg(long)]
@@ -88,6 +91,10 @@ impl Cli {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut registry = Registry::default();
+        if !self.compiler_regex.is_empty() {
+            let patterns: Vec<_> = self.compiler_regex.iter().map(String::as_str).collect();
+            registry.replace_patterns::<crate::commands::compiler::Compiler>(&patterns)?;
+        }
         for config in &self.python_script {
             let (identity, script) = config
                 .split_once('=')
@@ -153,12 +160,12 @@ impl Cli {
                         job.spec.parsed["unparsed_args"]
                     );
                 }
-                if let Some(reason) = job
-                    .spec
-                    .parsed
-                    .get("effect_reason")
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(reason) = job.spec.effect_reason.as_deref().or_else(|| {
+                    job.spec
+                        .parsed
+                        .get("effect_reason")
+                        .and_then(|v| v.as_str())
+                }) {
                     eprintln!(
                         "[EFFECTS] node {id}: {}: {reason}; inputs={:?}, outputs={:?}",
                         if job.spec.unknown_effects {

@@ -1,30 +1,52 @@
 use rusty_make::{
     graph::{BuildGraph, Edge},
     input::SourceCommand,
-    job::{ExecutionStrategy, Job, JobSpec, Operation},
+    job::{ExecutionContext, Job, JobRecord},
 };
-use std::path::PathBuf;
-fn job(inputs: &[&str], outputs: &[&str], unknown: bool) -> Job {
-    Job {
-        source: SourceCommand {
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TestEffects {
+    inputs: Vec<PathBuf>,
+    outputs: Vec<PathBuf>,
+    unknown: bool,
+}
+impl Job for TestEffects {
+    const TYPE: &'static str = "test.effects";
+    fn parse(_: &rusty_make::shell::ShellCommand) -> anyhow::Result<Self> {
+        anyhow::bail!("graph-effect fixtures are constructed directly")
+    }
+    fn inputs(&self) -> impl Iterator<Item = &Path> {
+        self.inputs.iter().map(PathBuf::as_path)
+    }
+    fn outputs(&self) -> impl Iterator<Item = &Path> {
+        self.outputs.iter().map(PathBuf::as_path)
+    }
+    fn unknown_effects(&self) -> bool {
+        self.unknown
+    }
+    fn execute(&self, ctx: &ExecutionContext<'_>) -> anyhow::Result<()> {
+        rusty_make::commands::external::execute_original(ctx)
+    }
+}
+fn job(inputs: &[&str], outputs: &[&str], unknown: bool) -> JobRecord {
+    JobRecord::new(
+        SourceCommand {
             line: 1,
             text: "test effect".into(),
             target: None,
         },
-        shell: None,
-        strategy: ExecutionStrategy::External,
-        spec: JobSpec {
-            kind: "test".into(),
-            operation: Operation::External,
+        None,
+        TestEffects {
             inputs: inputs.iter().map(PathBuf::from).collect(),
             outputs: outputs.iter().map(PathBuf::from).collect(),
-            unknown_effects: unknown,
-            cacheable: false,
-            parsed: serde_json::json!({}),
+            unknown,
         },
-    }
+    )
+    .unwrap()
 }
-fn graph(jobs: Vec<Job>) -> BuildGraph {
+fn graph(jobs: Vec<JobRecord>) -> BuildGraph {
     BuildGraph::new(jobs, &std::env::current_dir().unwrap()).unwrap()
 }
 #[test]

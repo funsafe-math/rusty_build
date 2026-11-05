@@ -1,58 +1,19 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{fs, path::Path, process::Command};
 
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
 use rusty_make::{
+    commands::generate_headers_py::GenerateHeadersPy,
     headers::add_generated_header_dependencies,
-    job::{JobSpec, Operation},
     parse_plan,
     registry::Registry,
     scheduler::{RunOptions, run},
-    shell::ShellCommand,
 };
-use serde_json::json;
 
 const COMMAND_LOG: &str = include_str!("../fixtures/python_headers/commands.log");
 const EXPECTED_OUTPUT: &str = "generated answer: 42\n";
 
-// This parser models one known script, not arbitrary Python programs. Registering
-// an opaque Python command with add_python would not declare these effects.
-#[derive(Parser)]
-#[command(disable_help_flag = true, disable_version_flag = true)]
-struct GenerateHeaderArgs {
-    script: PathBuf,
-    template: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
-}
-
-fn parse_generator(shell: &ShellCommand) -> Result<JobSpec> {
-    let args = GenerateHeaderArgs::try_parse_from(
-        std::iter::once(shell.program.as_str()).chain(shell.args.iter().map(String::as_str)),
-    )?;
-    ensure!(
-        args.script == Path::new("tools/generate_header.py"),
-        "the generator parser only models tools/generate_header.py"
-    );
-    let parsed = json!({
-        "script": args.script,
-        "template": args.template,
-        "output": args.output,
-    });
-    Ok(JobSpec {
-        kind: "generate-header".into(),
-        operation: Operation::External,
-        inputs: vec![args.script, args.template],
-        outputs: vec![args.output],
-        unknown_effects: false,
-        cacheable: false,
-        parsed,
-    })
-}
+// The registered Job owns this known script's parser, effects and batch execution.
+// Configured opaque Python identities intentionally do not declare these effects.
 
 fn require_tool(program: &str, description: &str) -> Result<()> {
     let output = Command::new(program)
@@ -102,11 +63,7 @@ fn main() -> Result<()> {
     }
 
     let mut registry = Registry::default();
-    registry.register(
-        "generate-header",
-        &[r"^\s*python3\s+tools/generate_header\.py(?:\s|$)"],
-        parse_generator,
-    )?;
+    registry.register::<GenerateHeadersPy>()?;
     // The compiler is deliberately BEFORE its generator in the fixture log.
     // Only this source opts into dependencies on generated headers in its -I dirs.
     let mut graph = parse_plan(COMMAND_LOG, root, &registry)?;

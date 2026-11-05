@@ -1,4 +1,4 @@
-use crate::job::{Job, Operation};
+use crate::job::{JobRecord, JobSnapshot};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,9 +27,9 @@ pub struct RequiredDependency {
     pub artifact: PathBuf,
     pub reason: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BuildGraph {
-    pub jobs: Vec<Job>,
+    pub jobs: Vec<JobRecord>,
     pub edges: Vec<Edge>,
     pub required_dependencies: Vec<RequiredDependency>,
     pub waves: Vec<Vec<usize>>,
@@ -39,7 +39,22 @@ pub struct BuildGraph {
     pub decisions: Vec<String>,
     pub diagnostics: Vec<crate::input::SourceDiagnostic>,
     /// Original jobs replaced by each executable node, in their original order.
-    pub provenance: Vec<Vec<Job>>,
+    pub provenance: Vec<Vec<JobRecord>>,
+}
+
+#[derive(Deserialize)]
+struct StoredGraph {
+    jobs: Vec<JobSnapshot>,
+    provenance: Vec<Vec<JobSnapshot>>,
+    cwd: PathBuf,
+    #[serde(default)]
+    edges: Vec<Edge>,
+    #[serde(default)]
+    required_dependencies: Vec<RequiredDependency>,
+    #[serde(default)]
+    decisions: Vec<String>,
+    #[serde(default)]
+    diagnostics: Vec<crate::input::SourceDiagnostic>,
 }
 
 /// Resolve existing ancestors to expose aliases, then normalize missing suffixes.
@@ -72,7 +87,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 }
 
 impl BuildGraph {
-    pub fn new(jobs: Vec<Job>, cwd: &Path) -> Result<Self> {
+    pub fn new(jobs: Vec<JobRecord>, cwd: &Path) -> Result<Self> {
         let cwd = cwd
             .canonicalize()
             .context("resolve build working directory")?;
@@ -91,12 +106,70 @@ impl BuildGraph {
         graph.rebuild()?;
         Ok(graph)
     }
+    /// Rehydrate every typed job using an explicit registry before exposing a
+    /// runnable graph. Unknown types/versions fail; no placeholder executors.
+    pub fn from_json(bytes: &[u8], registry: &crate::registry::Registry) -> Result<Self> {
+        let stored: StoredGraph = serde_json::from_slice(bytes).context("decode execution plan")?;
+        let jobs = stored
+            .jobs
+            .into_iter()
+            .map(|job| registry.restore(job))
+            .collect::<Result<Vec<_>>>()?;
+        let provenance = stored
+            .provenance
+            .into_iter()
+            .map(|originals| {
+                originals
+                    .into_iter()
+                    .map(|job| registry.restore(job))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if provenance.len() != jobs.len() {
+            bail!("plan provenance does not match executable node count");
+        }
+        if jobs.iter().zip(&provenance).any(|(job, originals)| {
+            !originals
+                .iter()
+                .any(|original| original.source.line == job.source.line)
+        }) {
+            bail!("plan provenance omits an executable node's source identity");
+        }
+        let mut graph = Self {
+            jobs,
+            provenance,
+            cwd: stored
+                .cwd
+                .canonicalize()
+                .context("resolve stored build directory")?,
+            edges: vec![],
+            required_dependencies: stored.required_dependencies,
+            waves: vec![],
+            reads: vec![],
+            writes: vec![],
+            decisions: stored.decisions,
+            diagnostics: stored.diagnostics,
+        };
+        graph.rebuild()?;
+        for edge in stored.edges {
+            if !graph
+                .edges
+                .iter()
+                .any(|existing| existing.from == edge.from && existing.to == edge.to)
+            {
+                graph.edges.push(edge);
+            }
+        }
+        graph.waves = graph.topological_waves()?;
+        Ok(graph)
+    }
+
     pub fn rebuild(&mut self) -> Result<()> {
         self.edges.clear();
         self.reads.clear();
         self.writes.clear();
         for job in &mut self.jobs {
-            crate::binutils::refine_existing(job, &self.cwd)?;
+            job.refine_effects(&self.cwd)?;
         }
         let mut versions = std::collections::BTreeMap::<PathBuf, u32>::new();
         let inputs: Vec<Vec<PathBuf>> = self
@@ -120,10 +193,9 @@ impl BuildGraph {
                     .iter()
                     .map(|p| normalize(&self.cwd, p))
                     .collect();
-                if matches!(j.spec.operation, Operation::Mkdir { parents: true, .. }) {
-                    // `mkdir -p build/a` also creates build, which may be needed
-                    // by a sibling output build/b. Include ancestors even when
-                    // currently present: earlier barriers may remove them.
+                if j.spec.creates_parents {
+                    // A job may create ancestors of its declared outputs.
+                    // Include them even if present: earlier barriers may remove them.
                     let directories: Vec<_> = effects.iter().cloned().collect();
                     for directory in directories {
                         for parent in directory.ancestors().skip(1) {

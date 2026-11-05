@@ -1,0 +1,4 @@
+cc -O2 -c src/calc_add.c -o build/calc_add.o
+cc -O2 -c src/calc_mul.c -o build/calc_mul.o
+cc -O2 -c src/main.c -o build/main.o
+cc build/calc_add.o build/calc_mul.o build/main.o -o build/unity-app

@@ -2,7 +2,7 @@
 
 use crate::{
     graph::{BuildGraph, RequiredDependency, normalize},
-    job::Job,
+    job::JobRecord,
 };
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -41,7 +41,7 @@ pub fn add_generated_header_dependencies<P>(
     predicate: P,
 ) -> Result<HeaderDependencyStats>
 where
-    P: Fn(&Job, &Path) -> bool,
+    P: Fn(&JobRecord, &Path) -> bool,
 {
     let mut writers = BTreeMap::<PathBuf, BTreeSet<usize>>::new();
     for (node, job) in graph.jobs.iter().enumerate() {

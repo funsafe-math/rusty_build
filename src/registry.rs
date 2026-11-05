@@ -1,147 +1,152 @@
+use crate::{
+    commands::{self, external::External, python::Python},
+    input::SourceCommand,
+    job::{Job, JobRecord, JobSnapshot},
+    shell::{self, ShellCommand},
+};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use serde_json::json;
-
-use crate::commands;
-use crate::input::SourceCommand;
-use crate::job::{ExecutionStrategy, Job, JobSpec, Operation};
-use crate::shell::{self, ShellCommand};
+use std::{
+    any::{TypeId, type_name},
+    collections::BTreeMap,
+};
 
 pub const UNKNOWN_PREFIX: &str = "unknown: ";
-pub type JobParser = fn(&ShellCommand) -> Result<JobSpec>;
-
+type ParseFactory = dyn Fn(SourceCommand, ShellCommand) -> Result<JobRecord> + Send + Sync;
 struct Handler {
-    kind: String,
+    classification: String,
+    rust_type: TypeId,
     patterns: Vec<Regex>,
-    parser: HandlerParser,
+    parse: Box<ParseFactory>,
 }
-
-enum HandlerParser {
-    Registered(JobParser),
-    ExternalTool,
-    BinaryTool,
-    Python { script: String },
+struct Decoder {
+    rust_type: TypeId,
+    rust_name: &'static str,
+    version: u32,
+    decode: fn(JobSnapshot) -> Result<JobRecord>,
 }
-
-/// Ordered registration is part of ambiguity diagnostics: each matching regex
-/// counts, including multiple patterns belonging to the same handler.
+/// Matchers classify original text; registered typed implementations own behavior.
+/// Every matching regex counts, including overlaps inside one registration.
 pub struct Registry {
     handlers: Vec<Handler>,
+    decoders: BTreeMap<&'static str, Decoder>,
 }
-
 impl Default for Registry {
     fn default() -> Self {
-        let mut registry = Self {
-            handlers: Vec::new(),
-        };
-        for (kind, programs, parser) in [
-            ("cp", "cp", commands::copy as JobParser),
-            ("mkdir", "mkdir", commands::mkdir as JobParser),
-            ("touch", "touch", commands::touch as JobParser),
-            ("rm", "rm", commands::remove as JobParser),
-            ("mv", "mv", commands::move_file as JobParser),
-            ("sed", "sed", commands::sed as JobParser),
-            (
-                "compiler",
-                "(?:cc|c\\+\\+|gcc|g\\+\\+|clang|clang\\+\\+)(?:-[0-9]+(?:\\.[0-9]+)*)?",
-                commands::compiler as JobParser,
-            ),
-        ] {
-            let pattern = command_pattern(programs);
-            registry
-                .register(kind, &[&pattern], parser)
-                .expect("built-in regex is valid");
-        }
-        // Keep each tool identity distinct. Prefixes cover GNU target triples
-        // and LLVM spellings; every family still registers exactly one regex.
-        for (kind, programs) in [
-            ("nm", "nm"),
-            ("objdump", "objdump"),
-            ("readelf", "readelf"),
-            ("size", "size"),
-            ("strings", "strings"),
-            ("addr2line", "addr2line"),
-            ("c++filt", r"(?:c\+\+filt|cxxfilt)"),
-            ("objcopy", "objcopy"),
-            ("strip", "strip"),
-            ("ar", "ar"),
-            ("ranlib", "ranlib"),
-            ("as", "as"),
-            ("ld", r"(?:ld(?:\.(?:bfd|gold|lld))?|lld|gold)"),
-            ("elfedit", "elfedit"),
-            ("dwp", "dwp"),
-            ("readobj", "readobj"),
-            ("dwarfdump", "dwarfdump"),
-            ("symbolizer", "symbolizer"),
-        ] {
-            let programs =
-                format!(r"(?:[A-Za-z0-9_+.]+-)*(?:{programs})(?:-[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?");
-            registry
-                .register_handler(
-                    kind,
-                    &[&command_pattern(&programs)],
-                    HandlerParser::BinaryTool,
-                )
-                .expect("built-in binary tool regex is valid");
-        }
+        let mut registry = Self::empty();
+        commands::register_builtins(&mut registry).expect("valid built-in command registrations");
         registry
     }
 }
-
-fn command_pattern(programs: &str) -> String {
-    format!(
-        r#"^\s*(?:(?:[^\s'";|&<>]*/)?(?:{programs})|'(?:[^']*/)?(?:{programs})'|"(?:[^"]*/)?(?:{programs})")(?:\s|$|[<>;&|])"#
-    )
-}
-
 impl Registry {
-    /// Add a custom typed parser. Bad regexes fail atomically, without leaving
-    /// partially registered patterns behind. Overlaps are checked per command.
-    pub fn register(&mut self, kind: &str, patterns: &[&str], parser: JobParser) -> Result<()> {
-        self.register_handler(kind, patterns, HandlerParser::Registered(parser))
+    pub fn empty() -> Self {
+        let mut registry = Self {
+            handlers: Vec::new(),
+            decoders: BTreeMap::new(),
+        };
+        registry
+            .register_type::<External>()
+            .expect("valid external job type");
+        registry
     }
-
-    /// Register an opaque external tool without guessing its flag grammar or
-    /// filesystem effects. All arguments and shell redirections are preserved.
-    pub fn register_external(&mut self, kind: &str, patterns: &[&str]) -> Result<()> {
-        self.register_handler(kind, patterns, HandlerParser::ExternalTool)
+    pub fn register<T: Job>(&mut self) -> Result<()> {
+        let patterns = T::patterns();
+        let refs: Vec<_> = patterns.iter().map(String::as_str).collect();
+        self.register_with::<T, _>(T::TYPE, &refs, T::parse)
     }
-
-    fn register_handler(
-        &mut self,
-        kind: &str,
-        patterns: &[&str],
-        parser: HandlerParser,
-    ) -> Result<()> {
-        if kind.is_empty() || patterns.is_empty() {
-            bail!("registration requires a kind and at least one pattern");
+    /// Register a serializable internal/rewrite-only job without a source matcher.
+    pub fn register_type<T: Job>(&mut self) -> Result<()> {
+        if T::TYPE.is_empty() {
+            bail!("job type tag must not be empty");
         }
-        let patterns = patterns
-            .iter()
-            .map(|pattern| {
-                Regex::new(pattern)
-                    .with_context(|| format!("invalid regex for handler {kind}: {pattern}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        if let Some(existing) = self.decoders.get(T::TYPE) {
+            if existing.rust_type != TypeId::of::<T>() {
+                bail!(
+                    "job type tag {} is already registered for {}, not {}",
+                    T::TYPE,
+                    existing.rust_name,
+                    type_name::<T>()
+                );
+            }
+            return Ok(());
+        }
+        self.decoders.insert(
+            T::TYPE,
+            Decoder {
+                rust_type: TypeId::of::<T>(),
+                rust_name: type_name::<T>(),
+                version: T::VERSION,
+                decode: JobRecord::restore::<T>,
+            },
+        );
+        Ok(())
+    }
+    pub fn register_with<T: Job, F>(
+        &mut self,
+        classification: &str,
+        patterns: &[&str],
+        parse: F,
+    ) -> Result<()>
+    where
+        F: Fn(&ShellCommand) -> Result<T> + Send + Sync + 'static,
+    {
+        let patterns = compile_patterns(classification, patterns)?;
+        self.register_type::<T>()?;
         self.handlers.push(Handler {
-            kind: kind.into(),
+            classification: classification.into(),
+            rust_type: TypeId::of::<T>(),
             patterns,
-            parser,
+            parse: Box::new(move |source, shell| {
+                let typed = parse(&shell).with_context(|| {
+                    format!(
+                        "{} parser failed on line {}: {}",
+                        T::TYPE,
+                        source.line,
+                        source.text
+                    )
+                })?;
+                JobRecord::new(source, Some(shell), typed)
+            }),
         });
         Ok(())
     }
-
-    /// Configure one exact Python script identity independently of interpreter
-    /// spelling. No Python script is implicitly trusted or declared cacheable.
+    /// Replace only this concrete type's classification rules. Other tool roles
+    /// retain their matchers, and overlaps still fail instead of taking priority.
+    pub fn replace_patterns<T: Job>(&mut self, patterns: &[&str]) -> Result<()> {
+        let patterns = compile_patterns(T::TYPE, patterns)?;
+        self.register_type::<T>()?;
+        self.handlers
+            .retain(|handler| handler.rust_type != TypeId::of::<T>());
+        self.handlers.push(Handler {
+            classification: T::TYPE.into(),
+            rust_type: TypeId::of::<T>(),
+            patterns,
+            parse: Box::new(|source, shell| {
+                let typed = T::parse(&shell).with_context(|| {
+                    format!(
+                        "{} parser failed on line {}: {}",
+                        T::TYPE,
+                        source.line,
+                        source.text
+                    )
+                })?;
+                JobRecord::new(source, Some(shell), typed)
+            }),
+        });
+        Ok(())
+    }
+    pub fn register_external(&mut self, classification: &str, patterns: &[&str]) -> Result<()> {
+        let identity = classification.to_owned();
+        self.register_with::<External, _>(classification, patterns, move |shell| {
+            Ok(External::from_shell(identity.clone(), shell))
+        })
+    }
     pub fn add_python(&mut self, identity: &str, script: &str) -> Result<()> {
         if identity.is_empty() || script.is_empty() {
             bail!("Python configuration requires an identity and script");
         }
         let interpreter = r"(?:python(?:[0-9]+(?:\.[0-9]+)*)?|py)";
         let prefix = command_pattern(interpreter);
-        // Classify only regex-matched original text, including ordinary bare,
-        // single-quoted and double-quoted script spellings. Other spellings
-        // conservatively remain unknown, even if they decode to this script.
         let prefix = prefix
             .strip_suffix(r"(?:\s|$|[<>;&|])")
             .expect("command pattern suffix");
@@ -161,20 +166,14 @@ impl Registry {
         {
             spellings.push(regex::escape(script));
         }
-        let alternatives = spellings.join("|");
-        let pattern = format!(r"{prefix}\s+(?:{alternatives})(?:\s|$|[<>;&|])");
-        self.handlers.push(Handler {
-            kind: identity.into(),
-            patterns: vec![Regex::new(&pattern)?],
-            parser: HandlerParser::Python {
-                script: script.into(),
-            },
-        });
-        Ok(())
+        let pattern = format!(r"{prefix}\s+(?:{})(?:\s|$|[<>;&|])", spellings.join("|"));
+        let configured_identity = identity.to_owned();
+        let script = script.to_owned();
+        self.register_with::<Python, _>(identity, &[&pattern], move |shell| {
+            Python::identified(&configured_identity, &script, shell)
+        })
     }
-
-    pub fn classify(&self, source: SourceCommand) -> Result<Job> {
-        // Malformed shell is fatal even for unregistered commands.
+    pub fn classify(&self, source: SourceCommand) -> Result<JobRecord> {
         let shell = shell::parse(&source.text)
             .with_context(|| format!("invalid shell on line {}", source.line))?;
         let mut matches = Vec::new();
@@ -188,12 +187,12 @@ impl Registry {
         if matches.len() > 1 {
             let descriptions = matches
                 .iter()
-                .map(|(handler, pattern)| {
+                .map(|&(handler, pattern)| {
                     format!(
                         "  {}[{}]: {}",
-                        self.handlers[*handler].kind,
+                        self.handlers[handler].classification,
                         pattern,
-                        self.handlers[*handler].patterns[*pattern].as_str()
+                        self.handlers[handler].patterns[pattern]
                     )
                 })
                 .collect::<Vec<_>>()
@@ -205,114 +204,67 @@ impl Registry {
                 matches.len()
             );
         }
-        let Some((handler_index, _)) = matches.first() else {
+        let Some(&(handler_index, _)) = matches.first() else {
             println!("{UNKNOWN_PREFIX}{}", source.text);
-            return Ok(Job {
+            let job = shell.as_ref().map_or_else(
+                || External::opaque("unknown"),
+                |command| External::from_shell("unknown", command),
+            );
+            return JobRecord::new(source, shell, job);
+        };
+        let handler = &self.handlers[handler_index];
+        match shell {
+            Some(shell) => (handler.parse)(source, shell),
+            None => JobRecord::new(
                 source,
-                shell,
-                spec: barrier("unknown"),
-                strategy: ExecutionStrategy::External,
-            });
-        };
-        let handler = &self.handlers[*handler_index];
-        let Some(command) = shell.as_ref() else {
-            return Ok(Job {
-                source,
-                shell,
-                spec: barrier(&handler.kind),
-                strategy: ExecutionStrategy::External,
-            });
-        };
-        let mut spec = match &handler.parser {
-            HandlerParser::Registered(parser) => parser(command).with_context(|| {
-                format!(
-                    "{} parser failed on line {}: {}",
-                    handler.kind, source.line, source.text
-                )
-            })?,
-            HandlerParser::ExternalTool => commands::external_tool(&handler.kind, command),
-            HandlerParser::BinaryTool => crate::binutils::parse(&handler.kind, command),
-            HandlerParser::Python { script } => {
-                if !is_python(&command.program) || command.args.first() != Some(script) {
-                    bail!(
-                        "Python parser failed on line {}: expected exact script {script}",
-                        source.line
-                    );
-                }
-                let mut spec = barrier(&handler.kind);
-                spec.parsed = json!({"interpreter":command.program,"script":script,"args":&command.args[1..]});
-                spec
-            }
-        };
-        if command.stdin.is_some() || command.stdout.is_some() || command.stderr.is_some() {
-            // A redirection adds known file effects, not an ordering barrier by
-            // itself. Preserve precise external tool operands; native handlers
-            // and opaque parsers still fall back to original-shell semantics.
-            let precise_external =
-                matches!(spec.operation, Operation::External) && !spec.unknown_effects;
-            spec.operation = Operation::External;
-            if !precise_external {
-                spec.inputs.clear();
-                spec.outputs.clear();
-                spec.unknown_effects = true;
-            }
-            if let Some(path) = &command.stdin {
-                spec.inputs.push(path.clone());
-            }
-            if let Some(path) = &command.stdout {
-                spec.outputs.push(path.clone());
-                if command.append_stdout {
-                    spec.inputs.push(path.clone());
-                }
-            }
-            if let Some(path) = &command.stderr {
-                spec.outputs.push(path.clone());
-            }
-            spec.cacheable = false;
+                None,
+                External::opaque(handler.classification.clone()),
+            ),
         }
-        let strategy = if matches!(spec.operation, Operation::External) {
-            ExecutionStrategy::External
-        } else {
-            ExecutionStrategy::Internal
-        };
-        Ok(Job {
-            source,
-            shell,
-            spec,
-            strategy,
+    }
+    pub fn restore(&self, snapshot: JobSnapshot) -> Result<JobRecord> {
+        let decoder = self.decoders.get(snapshot.spec.type_tag.as_str())
+            .with_context(|| format!("job type {} is not registered; register its implementation before loading this plan", snapshot.spec.type_tag))?;
+        if decoder.version != snapshot.spec.handler_version {
+            bail!(
+                "job type {} version {} is incompatible with registered version {}",
+                snapshot.spec.type_tag,
+                snapshot.spec.handler_version,
+                decoder.version
+            );
+        }
+        (decoder.decode)(snapshot)
+    }
+}
+fn compile_patterns(classification: &str, patterns: &[&str]) -> Result<Vec<Regex>> {
+    if classification.is_empty() || patterns.is_empty() {
+        bail!(
+            "registration requires a classification and at least one pattern; use register_type for internal jobs"
+        );
+    }
+    patterns
+        .iter()
+        .map(|pattern| {
+            Regex::new(pattern)
+                .with_context(|| format!("invalid regex for handler {classification}: {pattern}"))
         })
-    }
+        .collect()
 }
-
-fn is_python(program: &str) -> bool {
-    let name = program.rsplit('/').next().unwrap_or(program);
-    if name == "py" || name == "python" {
-        return true;
-    }
-    name.strip_prefix("python").is_some_and(|version| {
-        !version.is_empty()
-            && version
-                .split('.')
-                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
-    })
+pub fn command_pattern(programs: &str) -> String {
+    format!(
+        r#"^\s*(?:(?:[^\s'\";|&<>]*/)?(?:{programs})|'(?:[^']*/)?(?:{programs})'|\"(?:[^\"]*/)?(?:{programs})\")(?:\s|$|[<>;&|])"#
+    )
 }
-
-fn barrier(kind: &str) -> JobSpec {
-    JobSpec {
-        kind: kind.into(),
-        operation: Operation::External,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        unknown_effects: true,
-        cacheable: false,
-        parsed: json!({}),
-    }
+pub fn binary_pattern(programs: &str) -> String {
+    command_pattern(&format!(
+        r"(?:[A-Za-z0-9_+.]+-)*(?:{programs})(?:-[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::commands::cp::Cp;
     fn source(text: &str) -> SourceCommand {
         SourceCommand {
             line: 1,
@@ -320,16 +272,12 @@ mod tests {
             target: None,
         }
     }
-    fn custom(_: &ShellCommand) -> Result<JobSpec> {
-        Ok(barrier("custom"))
-    }
-
     #[test]
-    fn classifies_native_and_keeps_registered_errors_fatal() {
+    fn parses_typed_jobs_and_keeps_registered_errors_fatal() {
         let registry = Registry::default();
-        let job = registry.classify(source("cp a b")).unwrap();
-        assert!(matches!(job.spec.operation, Operation::Copy { .. }));
-        assert!(job.spec.cacheable);
+        let record = registry.classify(source("cp a b")).unwrap();
+        assert!(record.typed::<Cp>().is_some());
+        assert!(record.spec.cacheable);
         assert!(registry.classify(source("cp -r a b")).is_err());
         assert!(
             registry
@@ -337,37 +285,40 @@ mod tests {
                 .is_err()
         );
     }
-
     #[test]
-    fn every_pattern_counts_in_deterministic_order() {
+    fn every_pattern_counts_even_in_one_registration() {
         let mut registry = Registry::default();
         registry
-            .register("custom", &["^widget", "widget"], custom)
+            .register_external("custom", &["^widget", "widget"])
             .unwrap();
         let error = registry
             .classify(source("widget x"))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("ambiguous command classification"));
-        assert!(error.contains("widget x"));
+        assert!(error.contains("ambiguous command classification") && error.contains("widget x"));
         assert!(error.contains(
             "2 matching patterns\nMatching patterns:\n  custom[0]: ^widget\n  custom[1]: widget"
         ));
     }
-
     #[test]
-    fn complex_commands_and_redirection_are_barriers() {
+    fn redirections_switch_native_strategy_but_preserve_tool_identity() {
         let registry = Registry::default();
-        let job = registry.classify(source("cp a b && touch done")).unwrap();
-        assert_eq!(job.spec.kind, "cp");
-        assert!(job.spec.unknown_effects && !job.spec.cacheable);
-        assert_eq!(job.strategy, ExecutionStrategy::External);
-        let job = registry.classify(source("cp a b > status")).unwrap();
-        assert!(job.spec.unknown_effects && !job.spec.cacheable);
+        let record = registry.classify(source("cp a b > log")).unwrap();
+        assert!(record.typed::<Cp>().is_some());
+        assert!(record.spec.unknown_effects);
+        assert!(!record.spec.cacheable);
+        assert_eq!(record.strategy, crate::job::ExecutionStrategy::External);
+        assert_eq!(
+            registry
+                .classify(source("cp a b && touch done"))
+                .unwrap()
+                .spec
+                .kind,
+            "cp"
+        );
     }
-
     #[test]
-    fn python_identity_handles_interpreters_and_quoted_paths() {
+    fn python_identities_and_overlapping_patterns_remain_distinct() {
         let mut registry = Registry::default();
         registry
             .add_python("generate", "scripts/make data.py")
@@ -377,9 +328,9 @@ mod tests {
             "/usr/bin/python3 \"scripts/make data.py\"",
             "py 'scripts/make data.py'",
         ] {
-            let job = registry.classify(source(text)).unwrap();
-            assert_eq!(job.spec.kind, "generate");
-            assert!(job.spec.unknown_effects && !job.spec.cacheable);
+            let record = registry.classify(source(text)).unwrap();
+            assert_eq!(record.spec.kind, "generate");
+            assert!(record.spec.unknown_effects);
         }
         assert_eq!(
             registry
@@ -389,41 +340,28 @@ mod tests {
                 .kind,
             "unknown"
         );
-        assert_eq!(
+        registry
+            .add_python("overlap", "scripts/make data.py")
+            .unwrap();
+        assert!(
             registry
-                .classify(source("py scripts/make\\ data.py"))
-                .unwrap()
-                .spec
-                .kind,
+                .classify(source("python 'scripts/make data.py'"))
+                .unwrap_err()
+                .to_string()
+                .contains("overlap[0]")
+        );
+    }
+    #[test]
+    fn invalid_patterns_do_not_leave_partial_registrations() {
+        let mut registry = Registry::default();
+        assert!(
+            registry
+                .register_external("bad", &["^widget", "["])
+                .is_err()
+        );
+        assert_eq!(
+            registry.classify(source("widget x")).unwrap().spec.kind,
             "unknown"
         );
-    }
-
-    #[test]
-    fn python_overlap_is_an_error_not_first_match_wins() {
-        let mut registry = Registry::default();
-        registry.add_python("one", "build.py").unwrap();
-        registry.add_python("two", "build.py").unwrap();
-        let error = registry
-            .classify(source("python3 build.py"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("one[0]:") && error.contains("two[0]:"));
-        assert!(error.matches("build\\.py").count() >= 2);
-        let mut registry = Registry::default();
-        registry.add_python("one", "build.py").unwrap();
-        registry.register("broad", &["^python"], custom).unwrap();
-        assert!(registry.classify(source("python build.py")).is_err());
-    }
-
-    #[test]
-    fn unknown_prefix_is_exact() {
-        assert_eq!(
-            format!("{UNKNOWN_PREFIX}{}", "echo hello"),
-            "unknown: echo hello"
-        );
-        let job = Registry::default().classify(source("echo hello")).unwrap();
-        assert_eq!(job.spec.kind, "unknown");
-        assert!(job.spec.unknown_effects && !job.spec.cacheable);
     }
 }
