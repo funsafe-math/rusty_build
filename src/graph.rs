@@ -17,10 +17,21 @@ pub struct Edge {
     pub to: usize,
     pub reason: String,
 }
+
+/// An explicit semantic prerequisite, identified by original input lines so it
+/// remains valid when rewrites fuse executable nodes and retain provenance.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequiredDependency {
+    pub producer_line: usize,
+    pub consumer_line: usize,
+    pub artifact: PathBuf,
+    pub reason: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BuildGraph {
     pub jobs: Vec<Job>,
     pub edges: Vec<Edge>,
+    pub required_dependencies: Vec<RequiredDependency>,
     pub waves: Vec<Vec<usize>>,
     pub cwd: PathBuf,
     pub reads: Vec<Vec<ArtifactId>>,
@@ -69,6 +80,7 @@ impl BuildGraph {
             provenance: jobs.iter().cloned().map(|j| vec![j]).collect(),
             jobs,
             edges: vec![],
+            required_dependencies: vec![],
             waves: vec![],
             cwd,
             reads: vec![],
@@ -83,6 +95,9 @@ impl BuildGraph {
         self.edges.clear();
         self.reads.clear();
         self.writes.clear();
+        for job in &mut self.jobs {
+            crate::binutils::refine_existing(job, &self.cwd)?;
+        }
         let mut versions = std::collections::BTreeMap::<PathBuf, u32>::new();
         let inputs: Vec<Vec<PathBuf>> = self
             .jobs
@@ -122,6 +137,55 @@ impl BuildGraph {
                 effects.into_iter().collect()
             })
             .collect();
+        let mut required_pairs = BTreeSet::new();
+        let mut required = Vec::with_capacity(self.required_dependencies.len());
+        let mut final_reads = std::collections::BTreeMap::<usize, BTreeSet<PathBuf>>::new();
+        for (index, dependency) in self.required_dependencies.iter().enumerate() {
+            let producer = self.node_for_source_line(dependency.producer_line)?;
+            let consumer = self.node_for_source_line(dependency.consumer_line)?;
+            if producer == consumer {
+                bail!(
+                    "required dependency resolves to the same executable node: source line {}",
+                    dependency.consumer_line
+                );
+            }
+            let artifact = normalize(&self.cwd, &dependency.artifact);
+            if !outputs[producer].contains(&artifact) {
+                bail!(
+                    "required producer line {} does not declare output {}",
+                    dependency.producer_line,
+                    artifact.display()
+                );
+            }
+            required_pairs.insert((producer, consumer));
+            final_reads.entry(consumer).or_default().insert(artifact);
+            required.push((producer, consumer, index));
+        }
+        let mut final_versions = std::collections::BTreeMap::<PathBuf, u32>::new();
+        for (&consumer, artifacts) in &final_reads {
+            for artifact in artifacts {
+                if !final_versions.contains_key(artifact) {
+                    final_versions.insert(artifact.clone(), 0);
+                }
+                for (producer, paths) in outputs.iter().enumerate() {
+                    if paths.contains(artifact) && !required_pairs.contains(&(producer, consumer)) {
+                        bail!(
+                            "final-artifact dependency {} is missing producer line {} for consumer line {}",
+                            artifact.display(),
+                            self.jobs[producer].source.line,
+                            self.jobs[consumer].source.line
+                        );
+                    }
+                }
+            }
+        }
+        if !final_versions.is_empty() {
+            for path in outputs.iter().flatten() {
+                if let Some(version) = final_versions.get_mut(path) {
+                    *version += 1;
+                }
+            }
+        }
         // Different hardlink names are aliases that lexical paths cannot expose.
         // Keep any such operation behind a barrier instead of guessing independence.
         let aliased: Vec<bool> = inputs
@@ -148,7 +212,11 @@ impl BuildGraph {
                     .iter()
                     .map(|p| ArtifactId {
                         path: p.clone(),
-                        version: *versions.get(p).unwrap_or(&0),
+                        version: if final_reads.get(&i).is_some_and(|paths| paths.contains(p)) {
+                            *final_versions.get(p).unwrap_or(&0)
+                        } else {
+                            *versions.get(p).unwrap_or(&0)
+                        },
                     })
                     .collect(),
             );
@@ -166,13 +234,14 @@ impl BuildGraph {
                     .collect(),
             );
             for prior in 0..i {
-                let reason = if self.jobs[i].spec.unknown_effects
-                    || self.jobs[prior].spec.unknown_effects
-                    || aliased[i]
-                    || aliased[prior]
-                {
-                    Some("unknown-effect or filesystem-alias ordering barrier")
-                } else if outputs[prior]
+                // Required generated inputs intentionally read the generated
+                // final version, rather than an older file at this log position.
+                // Other data hazards are never overridden by a policy.
+                let reverse_prerequisite = required_pairs.contains(&(i, prior))
+                    && !self.jobs[i].spec.unknown_effects
+                    && !aliased[i]
+                    && !aliased[prior];
+                let reason = if outputs[prior]
                     .iter()
                     .any(|a| inputs[i].iter().any(|b| overlaps(a, b)))
                 {
@@ -184,9 +253,21 @@ impl BuildGraph {
                     Some("write after write")
                 } else if inputs[prior]
                     .iter()
+                    .filter(|path| {
+                        !final_reads
+                            .get(&prior)
+                            .is_some_and(|paths| paths.contains(*path))
+                    })
                     .any(|a| outputs[i].iter().any(|b| overlaps(a, b)))
                 {
                     Some("write after read")
+                } else if !reverse_prerequisite
+                    && (self.jobs[i].spec.unknown_effects
+                        || self.jobs[prior].spec.unknown_effects
+                        || aliased[i]
+                        || aliased[prior])
+                {
+                    Some("unknown-effect or filesystem-alias ordering barrier")
                 } else {
                     None
                 };
@@ -199,9 +280,44 @@ impl BuildGraph {
                 }
             }
         }
+        for (producer, consumer, index) in required {
+            let reason = &self.required_dependencies[index].reason;
+            if let Some(edge) = self
+                .edges
+                .iter_mut()
+                .find(|e| e.from == producer && e.to == consumer)
+            {
+                if !edge.reason.split("; ").any(|part| part == reason.as_str()) {
+                    edge.reason.push_str("; ");
+                    edge.reason.push_str(reason);
+                }
+            } else {
+                self.edges.push(Edge {
+                    from: producer,
+                    to: consumer,
+                    reason: reason.clone(),
+                });
+            }
+        }
         self.waves = self.topological_waves()?;
         Ok(())
     }
+    fn node_for_source_line(&self, line: usize) -> Result<usize> {
+        let mut nodes = self
+            .provenance
+            .iter()
+            .enumerate()
+            .filter(|(_, originals)| originals.iter().any(|job| job.source.line == line))
+            .map(|(index, _)| index);
+        let Some(node) = nodes.next() else {
+            bail!("required dependency source line {line} is absent from graph provenance");
+        };
+        if nodes.next().is_some() {
+            bail!("required dependency source line {line} is ambiguous");
+        }
+        Ok(node)
+    }
+
     pub fn topological_waves(&self) -> Result<Vec<Vec<usize>>> {
         let mut degree = vec![0; self.jobs.len()];
         let mut next = vec![vec![]; self.jobs.len()];

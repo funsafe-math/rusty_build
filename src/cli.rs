@@ -37,6 +37,9 @@ pub struct Cli {
     /// Identify one script independently, e.g. --python-script generate=tools/generate.py
     #[arg(long, value_name = "IDENTITY=PATH")]
     pub python_script: Vec<String>,
+    /// Add generated headers under include directories for sources matching REGEX.
+    #[arg(long, value_name = "REGEX")]
+    pub generated_header_source: Vec<String>,
     /// Pass one Make argument (use --make-arg=-f for options).
     #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
     pub make_arg: Vec<String>,
@@ -76,6 +79,14 @@ impl Cli {
         }
         let start = Instant::now();
         let cwd = std::env::current_dir()?;
+        let header_sources = self
+            .generated_header_source
+            .iter()
+            .map(|pattern| {
+                regex::Regex::new(pattern)
+                    .with_context(|| format!("invalid --generated-header-source regex: {pattern}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut registry = Registry::default();
         for config in &self.python_script {
             let (identity, script) = config
@@ -106,6 +117,18 @@ impl Cli {
                 .decisions
                 .push("graph rewriting disabled by --no-optimize".into());
         }
+        if !header_sources.is_empty() {
+            let stats =
+                crate::headers::add_generated_header_dependencies(&mut graph, |_, source| {
+                    header_sources
+                        .iter()
+                        .any(|pattern| pattern.is_match(&source.to_string_lossy()))
+                })?;
+            eprintln!(
+                "[HEADERS] {} selected jobs, {} added inputs, {} producer dependencies",
+                stats.selected_jobs, stats.added_inputs, stats.added_dependencies
+            );
+        }
         eprintln!(
             "[GRAPH] {} nodes, {} dependencies, {} waves",
             graph.jobs.len(),
@@ -130,9 +153,34 @@ impl Cli {
                         job.spec.parsed["unparsed_args"]
                     );
                 }
+                if let Some(reason) = job
+                    .spec
+                    .parsed
+                    .get("effect_reason")
+                    .and_then(|v| v.as_str())
+                {
+                    eprintln!(
+                        "[EFFECTS] node {id}: {}: {reason}; inputs={:?}, outputs={:?}",
+                        if job.spec.unknown_effects {
+                            "barrier"
+                        } else {
+                            "precise"
+                        },
+                        job.spec.inputs,
+                        job.spec.outputs
+                    );
+                }
             }
             for edge in &graph.edges {
                 eprintln!("[GRAPH] {} -> {}: {}", edge.from, edge.to, edge.reason);
+            }
+            for dependency in &graph.required_dependencies {
+                eprintln!(
+                    "[HEADERS] {}: producer line {} -> compiler line {}",
+                    dependency.artifact.display(),
+                    dependency.producer_line,
+                    dependency.consumer_line
+                );
             }
             for diagnostic in &graph.diagnostics {
                 eprintln!("[INPUT] line {:?}: {}", diagnostic.line, diagnostic.text);

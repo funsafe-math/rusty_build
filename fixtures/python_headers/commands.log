@@ -1,0 +1,2 @@
+cc -I generated src/special.c -o build/generated-app
+python3 tools/generate_header.py templates/generated.h.in --output generated/generated.h

@@ -18,6 +18,8 @@ struct Handler {
 
 enum HandlerParser {
     Registered(JobParser),
+    ExternalTool,
+    BinaryTool,
     Python { script: String },
 }
 
@@ -50,6 +52,38 @@ impl Default for Registry {
                 .register(kind, &[&pattern], parser)
                 .expect("built-in regex is valid");
         }
+        // Keep each tool identity distinct. Prefixes cover GNU target triples
+        // and LLVM spellings; every family still registers exactly one regex.
+        for (kind, programs) in [
+            ("nm", "nm"),
+            ("objdump", "objdump"),
+            ("readelf", "readelf"),
+            ("size", "size"),
+            ("strings", "strings"),
+            ("addr2line", "addr2line"),
+            ("c++filt", r"(?:c\+\+filt|cxxfilt)"),
+            ("objcopy", "objcopy"),
+            ("strip", "strip"),
+            ("ar", "ar"),
+            ("ranlib", "ranlib"),
+            ("as", "as"),
+            ("ld", r"(?:ld(?:\.(?:bfd|gold|lld))?|lld|gold)"),
+            ("elfedit", "elfedit"),
+            ("dwp", "dwp"),
+            ("readobj", "readobj"),
+            ("dwarfdump", "dwarfdump"),
+            ("symbolizer", "symbolizer"),
+        ] {
+            let programs =
+                format!(r"(?:[A-Za-z0-9_+.]+-)*(?:{programs})(?:-[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?");
+            registry
+                .register_handler(
+                    kind,
+                    &[&command_pattern(&programs)],
+                    HandlerParser::BinaryTool,
+                )
+                .expect("built-in binary tool regex is valid");
+        }
         registry
     }
 }
@@ -64,6 +98,21 @@ impl Registry {
     /// Add a custom typed parser. Bad regexes fail atomically, without leaving
     /// partially registered patterns behind. Overlaps are checked per command.
     pub fn register(&mut self, kind: &str, patterns: &[&str], parser: JobParser) -> Result<()> {
+        self.register_handler(kind, patterns, HandlerParser::Registered(parser))
+    }
+
+    /// Register an opaque external tool without guessing its flag grammar or
+    /// filesystem effects. All arguments and shell redirections are preserved.
+    pub fn register_external(&mut self, kind: &str, patterns: &[&str]) -> Result<()> {
+        self.register_handler(kind, patterns, HandlerParser::ExternalTool)
+    }
+
+    fn register_handler(
+        &mut self,
+        kind: &str,
+        patterns: &[&str],
+        parser: HandlerParser,
+    ) -> Result<()> {
         if kind.is_empty() || patterns.is_empty() {
             bail!("registration requires a kind and at least one pattern");
         }
@@ -77,7 +126,7 @@ impl Registry {
         self.handlers.push(Handler {
             kind: kind.into(),
             patterns,
-            parser: HandlerParser::Registered(parser),
+            parser,
         });
         Ok(())
     }
@@ -181,6 +230,8 @@ impl Registry {
                     handler.kind, source.line, source.text
                 )
             })?,
+            HandlerParser::ExternalTool => commands::external_tool(&handler.kind, command),
+            HandlerParser::BinaryTool => crate::binutils::parse(&handler.kind, command),
             HandlerParser::Python { script } => {
                 if !is_python(&command.program) || command.args.first() != Some(script) {
                     bail!(
@@ -194,12 +245,29 @@ impl Registry {
             }
         };
         if command.stdin.is_some() || command.stdout.is_some() || command.stderr.is_some() {
-            // Redirection introduces extra filesystem dependencies and failure
-            // side effects; retain parsed metadata but execute as a full barrier.
+            // A redirection adds known file effects, not an ordering barrier by
+            // itself. Preserve precise external tool operands; native handlers
+            // and opaque parsers still fall back to original-shell semantics.
+            let precise_external =
+                matches!(spec.operation, Operation::External) && !spec.unknown_effects;
             spec.operation = Operation::External;
-            spec.inputs.clear();
-            spec.outputs.clear();
-            spec.unknown_effects = true;
+            if !precise_external {
+                spec.inputs.clear();
+                spec.outputs.clear();
+                spec.unknown_effects = true;
+            }
+            if let Some(path) = &command.stdin {
+                spec.inputs.push(path.clone());
+            }
+            if let Some(path) = &command.stdout {
+                spec.outputs.push(path.clone());
+                if command.append_stdout {
+                    spec.inputs.push(path.clone());
+                }
+            }
+            if let Some(path) = &command.stderr {
+                spec.outputs.push(path.clone());
+            }
             spec.cacheable = false;
         }
         let strategy = if matches!(spec.operation, Operation::External) {

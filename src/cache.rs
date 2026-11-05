@@ -134,8 +134,13 @@ impl Cache {
     }
     pub fn check(&self, graph: &BuildGraph, i: usize) -> Result<std::result::Result<(), String>> {
         let job = &graph.jobs[i];
-        if !job.spec.cacheable || job.spec.unknown_effects {
-            return Ok(Err("effects or complete inputs cannot be validated".into()));
+        if job.spec.unknown_effects {
+            return Ok(Err(
+                "filesystem effects cannot be completely validated".into()
+            ));
+        }
+        if !job.spec.cacheable {
+            return Ok(Err("job is not incrementally cacheable".into()));
         }
         let Some(old) = self.store.records.get(&Self::key(graph, i)) else {
             return Ok(Err("no successful cache record".into()));

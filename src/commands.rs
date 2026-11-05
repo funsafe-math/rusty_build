@@ -33,6 +33,23 @@ fn native(
     }
 }
 
+/// An intentionally opaque argument vector: tool-specific options are owned by
+/// the real executable, not interpreted or dropped by a generic CLI grammar.
+pub(crate) fn external_tool(kind: &str, shell: &ShellCommand) -> JobSpec {
+    let argv: Vec<&str> = std::iter::once(shell.program.as_str())
+        .chain(shell.args.iter().map(String::as_str))
+        .collect();
+    native(
+        kind,
+        Operation::External,
+        vec![],
+        vec![],
+        false,
+        true,
+        json!({"argv": argv, "argument_parsing": "passthrough"}),
+    )
+}
+
 #[derive(Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 struct CopyArgs {
@@ -210,6 +227,12 @@ pub fn sed(shell: &ShellCommand) -> Result<JobSpec> {
 struct CompilerArgs {
     #[arg(short = 'I', allow_hyphen_values = true)]
     includes: Vec<PathBuf>,
+    #[arg(long = "rusty-system-include", allow_hyphen_values = true)]
+    system_includes: Vec<PathBuf>,
+    #[arg(long = "rusty-quote-include", allow_hyphen_values = true)]
+    quote_includes: Vec<PathBuf>,
+    #[arg(long = "rusty-after-include", allow_hyphen_values = true)]
+    after_includes: Vec<PathBuf>,
     #[arg(short = 'L', allow_hyphen_values = true)]
     library_paths: Vec<PathBuf>,
     #[arg(short = 'D')]
@@ -278,6 +301,16 @@ fn source_file(path: &Path) -> bool {
         )
 }
 
+fn include_option(arg: &str) -> Option<(&'static str, &str)> {
+    [
+        ("-isystem", "--rusty-system-include"),
+        ("-iquote", "--rusty-quote-include"),
+        ("-idirafter", "--rusty-after-include"),
+    ]
+    .into_iter()
+    .find_map(|(flag, normalized)| arg.strip_prefix(flag).map(|value| (normalized, value)))
+}
+
 pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
     let mut args = Vec::with_capacity(shell.args.len());
     let mut unparsed_args = Vec::new();
@@ -296,6 +329,14 @@ pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
             positional_only = true;
             opaque_operands = false;
             args.push(arg.clone());
+        } else if !positional_only && let Some((normalized, value)) = include_option(arg) {
+            opaque_operands = false;
+            if value.is_empty() {
+                operand_value = true;
+                args.push(normalized.into());
+            } else {
+                args.push(format!("{normalized}={value}"));
+            }
         } else if !positional_only && matches!(arg.as_str(), "-I" | "-L" | "-D" | "-o") {
             operand_value = true;
             opaque_operands = false;
@@ -386,6 +427,13 @@ pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
     } else {
         args.output.clone()
     };
+    let includes: Vec<_> = args
+        .includes
+        .into_iter()
+        .chain(args.system_includes)
+        .chain(args.quote_includes)
+        .chain(args.after_includes)
+        .collect();
     let argv: Vec<&str> = std::iter::once(shell.program.as_str())
         .chain(shell.args.iter().map(String::as_str))
         .collect();
@@ -396,7 +444,7 @@ pub fn compiler(shell: &ShellCommand) -> Result<JobSpec> {
         outputs,
         false,
         true,
-        json!({"argv":argv,"sources":sources,"output":output,"compile_only":args.compile_only,"includes":args.includes,"library_paths":args.library_paths,"defines":args.defines,"optimization":args.optimization,"debug":args.debug,"unparsed_args":unparsed_args,"metadata_complete":metadata_complete}),
+        json!({"argv":argv,"sources":sources,"output":output,"compile_only":args.compile_only,"includes":includes,"library_paths":args.library_paths,"defines":args.defines,"optimization":args.optimization,"debug":args.debug,"unparsed_args":unparsed_args,"metadata_complete":metadata_complete}),
     ))
 }
 

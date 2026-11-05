@@ -74,6 +74,7 @@ fn absolute(cwd: &Path, path: &Path) -> PathBuf {
 
 /// External jobs always execute the original text, never reconstructed argv.
 pub fn execute(job: &Job, cwd: &Path) -> Result<()> {
+    crate::binutils::validate_runtime(job, cwd)?;
     // Native handlers cannot silently discard redirection. Classification normally
     // turns these into barriers, but retain this guard for public/custom jobs.
     let redirected = job

@@ -1,8 +1,10 @@
+mod binutils;
 pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod compdb;
 pub mod graph;
+pub mod headers;
 pub mod input;
 pub mod job;
 pub mod make;
