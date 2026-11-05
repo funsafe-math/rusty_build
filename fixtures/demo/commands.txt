@@ -1,0 +1,16 @@
+Makefile:12: update target 'build/app' due to: src/main.c src/value.c
+mkdir -p build
+cp src/value.c build/stage.c
+cp build/stage.c build/template.c
+cp assets/info.txt build/info.txt
+cp assets/other.txt build/other.txt
+sed 's/PLACEHOLDER/7/g' build/template.c > build/value.c
+python3 tools/generate.py build/generated.h
+python3 tools/transform.py build/info.txt build/info.upper
+gcc -Ibuild -Isrc -O2 -c build/value.c -o build/value.o
+gcc -Ibuild -O2 -c src/main.c -o build/main.o
+gcc build/main.o build/value.o -o build/app
+printf marker > build/marker.txt
+touch build/stamp
+mv build/other.txt build/moved.txt
+rm build/moved.txt
