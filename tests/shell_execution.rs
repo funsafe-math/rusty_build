@@ -230,3 +230,59 @@ fn execution_cwd_supports_forward_slash_operands_and_legacy_plan_roots() {
         b"cwd payload"
     );
 }
+
+#[test]
+fn mkdir_uses_relative_build_cwd_and_preserves_existing_files() {
+    let process_cwd = std::env::current_dir().unwrap();
+    let root = tempfile::tempdir_in(&process_cwd).unwrap();
+    fs::write(root.path().join("source"), b"relative cwd payload").unwrap();
+    let relative_cwd = root.path().strip_prefix(&process_cwd).unwrap();
+    let registry = Registry::default();
+    let graph = parse_plan(
+        "mkdir -p 'tree/leaf'\ncp source 'tree/leaf/result'\nmkdir -p 'tree/leaf'\n",
+        relative_cwd,
+        &registry,
+    )
+    .unwrap();
+    let options = RunOptions {
+        rebuild_all: true,
+        ..Default::default()
+    };
+    run(&graph, &options).unwrap();
+    assert_eq!(
+        fs::read(root.path().join("tree/leaf/result")).unwrap(),
+        b"relative cwd payload"
+    );
+    fs::write(root.path().join("blocker"), b"keep file").unwrap();
+    let blocked = parse_plan("mkdir -p blocker/child\n", relative_cwd, &registry).unwrap();
+    assert!(run(&blocked, &options).is_err());
+    assert_eq!(fs::read(root.path().join("blocker")).unwrap(), b"keep file");
+}
+
+#[cfg(windows)]
+#[test]
+fn mkdir_accepts_complete_windows_drive_and_verbatim_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let ordinary = root.path().join("absolute tree/leaf");
+    let verbatim = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("verbatim tree/leaf");
+    let forward = ordinary.to_string_lossy().replace('\\', "/");
+    let text = format!(
+        "mkdir -p {} {}\ncp input.txt {}\n",
+        shell_words::quote(&forward),
+        shell_words::quote(verbatim.to_str().unwrap()),
+        shell_words::quote(&format!("{forward}/output.txt")),
+    );
+    fs::write(root.path().join("input.txt"), b"complete Windows paths").unwrap();
+    let graph = parse_plan(&text, root.path(), &Registry::default()).unwrap();
+    run(&graph, &RunOptions::default()).unwrap();
+    assert!(ordinary.is_dir());
+    assert!(verbatim.is_dir());
+    assert_eq!(
+        fs::read(ordinary.join("output.txt")).unwrap(),
+        b"complete Windows paths"
+    );
+}

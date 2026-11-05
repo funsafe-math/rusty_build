@@ -1,8 +1,7 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +63,8 @@ impl Job for Mkdir {
         for path in &self.paths {
             let path = ctx.absolute(path);
             if self.parents {
-                mkdir_parents(&path)?;
+                fs::create_dir_all(&path)
+                    .with_context(|| format!("mkdir -p {}", path.display()))?;
             } else {
                 fs::create_dir(&path).with_context(|| format!("mkdir {}", path.display()))?;
             }
@@ -74,58 +74,5 @@ impl Job for Mkdir {
 
     fn execute_batch(items: &[BatchItem<'_, Self>], ctx: &BatchContext<'_>) -> BatchReport {
         ctx.run_each(items, |job, execution| job.execute(execution))
-    }
-}
-
-fn mkdir_parents(path: &Path) -> Result<()> {
-    let mut current = PathBuf::new();
-    let mut components = path.components().peekable();
-    if components.peek().is_none() {
-        bail!("mkdir: empty path");
-    }
-    while let Some(component) = components.next() {
-        current.push(component.as_os_str());
-        match fs::create_dir(&current) {
-            Ok(()) => {
-                // GNU mkdir -p gives newly created intermediate directories
-                // owner write/search even when umask removes those bits.
-                #[cfg(unix)]
-                if components.peek().is_some() {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = fs::metadata(&current)?.permissions().mode();
-                    fs::set_permissions(&current, fs::Permissions::from_mode(mode | 0o300))?;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && current.is_dir() => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("mkdir -p {}", current.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mkdir_parent_subset() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a/b");
-        mkdir_parents(&path).unwrap();
-        mkdir_parents(&path).unwrap();
-        assert!(path.is_dir());
-    }
-
-    #[test]
-    fn parent_effect_marker_matches_option() {
-        let mut job = Mkdir {
-            paths: vec!["a/b".into()],
-            parents: false,
-        };
-        assert!(!job.creates_parents());
-        job.parents = true;
-        assert!(job.creates_parents());
     }
 }

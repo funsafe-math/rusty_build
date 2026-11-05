@@ -341,7 +341,7 @@ arbitrary C source/link equivalence.
 | Type | Implemented behavior | Conservative boundary |
 | --- | --- | --- |
 | `cp SRC DST` | In-process regular-file copy; existing destination permissions retained; new mode respects umask | Exactly two operands; directories, symlink operands, special bits and multiply-linked destinations rejected; no flags |
-| `mkdir [-p\|--parents] PATH...` | Native creation; intermediate owner write/search for `-p` | Mode options rejected; overlapping directory effects ordered |
+| `mkdir [-p\|--parents] PATH...` | `std::fs::create_dir`; `std::fs::create_dir_all` for `-p`, with no manual path traversal | Platform permission rules, no custom GNU umask emulation; mode options rejected; overlapping directory effects ordered |
 | `touch PATH...` | Native creation or atime/mtime update | Ordinary files only; no options; never skipped |
 | `rm [-f] [-r\|-R\|--recursive] PATH...` | Native unlink and recursive tree removal; combined `-rf`/`-fr`; force ignores missing operands | Never follows symlink targets; rejects symlink ancestors, root/`.`/`..` and directory-only operands naming regular files before deletion; barrier; never skipped |
 | `mv SRC DST` | Native regular-file rename | Same filesystem; no options, directory/symlink/multiply-linked destination behavior; barrier; never skipped |
@@ -700,7 +700,7 @@ project is required. Run `cargo build` and `cargo test` on the Linux host.
 Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
 
 * `cargo build`: successful.
-* `cargo test`: **271 passed** across 23 suites, no failures, including real coan,
+* `cargo test`: **270 passed** across 23 suites, no failures, including real coan,
   gawk, compiler, Python, sed, Make and differential fixture execution.
 * Standalone CLI fixture: 15 commands became 14 nodes with one copy-chain rewrite;
   generated application printed `12`. DOT, plan JSON and a two-entry compilation
@@ -760,6 +760,11 @@ Verified on Linux with Rust 1.94.0, GNU Make 4.3 and GCC 13.3:
   under Wine 9.0. A real CLI run created nested directories, copied and touched
   files using forward-slash operands. The regression also executed from a cwd
   containing spaces/non-ASCII characters and restored an older verbatim-root plan.
+* Windows mkdir regressions: ordinary drive-absolute, verbatim and relative
+  operands passed under Wine. A CLI run from `C:\cwd-fixture` created both
+  relative nested directories and an absolute `C:/...` directory, then copied
+  the expected bytes. Recursive creation passes complete paths to Rust's
+  filesystem API rather than attempting to create partial drive prefixes.
 
 Commands and diagnostics both retain their original input line numbers in JSON;
 rewrite provenance preserves removed command records. Synthetic planner warnings
