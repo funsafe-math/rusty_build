@@ -1,41 +1,33 @@
-use std::path::{Path, PathBuf};
-
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
-
-use crate::job::{ExecutionContext, Job};
-use crate::registry::command_pattern;
-use crate::shell::ShellCommand;
-
 use super::external::execute_argv;
+use crate::{
+    job::{FileAccess, Job, JobData},
+    shell::ShellHints,
+};
+use anyhow::{Result, bail};
 
-/// External awk execution with only unambiguous command-line inputs described.
-/// Program text is never interpreted to infer its filesystem effects.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Awk programs can open arbitrary files; only explicit command-line reads are inferred.
+#[derive(Debug)]
 pub struct Gawk {
+    pub data: JobData,
     pub argv: Vec<String>,
     pub programs: Vec<String>,
-    pub script_files: Vec<PathBuf>,
+    pub script_files: Vec<String>,
     pub field_separators: Vec<String>,
     pub assignments: Vec<String>,
     pub operands: Vec<String>,
-    pub data_files: Vec<PathBuf>,
-    /// False when an unknown option makes the remaining operand grammar unknown.
+    pub data_files: Vec<String>,
     pub metadata_complete: bool,
 }
 
-impl Job for Gawk {
-    const TYPE: &'static str = "gawk";
-
-    fn patterns() -> Vec<String> {
-        vec![command_pattern("gawk")]
-    }
-
-    fn parse(shell: &ShellCommand) -> Result<Self> {
+impl Gawk {
+    pub fn parse(argv: &[String], _hints: &ShellHints) -> Result<Self> {
+        let args = argv.get(1..).unwrap_or_default();
         let mut job = Self {
-            argv: std::iter::once(shell.program.clone())
-                .chain(shell.args.iter().cloned())
-                .collect(),
+            data: JobData {
+                unknown_effects: true,
+                ..JobData::default()
+            },
+            argv: argv.to_vec(),
             programs: Vec::new(),
             script_files: Vec::new(),
             field_separators: Vec::new(),
@@ -47,7 +39,7 @@ impl Job for Gawk {
         let mut index = 0;
         let mut options = true;
         let mut informational = false;
-        while let Some(arg) = shell.args.get(index) {
+        while let Some(arg) = args.get(index) {
             if options && arg == "--" {
                 options = false;
                 index += 1;
@@ -82,7 +74,7 @@ impl Job for Gawk {
                         Some(value) => value,
                         None => {
                             index += 1;
-                            shell.args.get(index).map(String::as_str).ok_or_else(|| {
+                            args.get(index).map(String::as_str).ok_or_else(|| {
                                 anyhow::anyhow!("gawk option {arg} requires a value")
                             })?
                         }
@@ -148,12 +140,12 @@ impl Job for Gawk {
             }
             // After the program (or the first data operand with -f/-e), awk
             // treats remaining arguments as operands, not command-line options.
-            job.operands.extend(shell.args[index..].iter().cloned());
+            job.operands.extend(args[index..].iter().cloned());
             job.data_files.extend(
                 job.operands
                     .iter()
                     .filter(|arg| arg.as_str() != "-" && !is_assignment(arg))
-                    .map(PathBuf::from),
+                    .cloned(),
             );
             break;
         }
@@ -164,27 +156,27 @@ impl Job for Gawk {
         {
             bail!("gawk requires a program or script file");
         }
+        job.data.accesses.extend(
+            job.script_files
+                .iter()
+                .chain(&job.data_files)
+                .filter(|path| path.as_str() != "-")
+                .cloned()
+                .map(FileAccess::read),
+        );
         Ok(job)
     }
+}
 
-    fn inputs(&self) -> impl Iterator<Item = &Path> {
-        self.script_files
-            .iter()
-            .chain(&self.data_files)
-            .filter(|path| path.as_path() != Path::new("-"))
-            .map(PathBuf::as_path)
+impl Job for Gawk {
+    fn data(&self) -> &JobData {
+        &self.data
     }
-
-    fn outputs(&self) -> impl Iterator<Item = &Path> {
-        std::iter::empty()
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
     }
-
-    fn unknown_effects(&self) -> bool {
-        true
-    }
-
-    fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        execute_argv(&self.argv, ctx)
+    fn execute(&self) -> Result<()> {
+        execute_argv(&self.argv, &self.data.shell)
     }
 }
 

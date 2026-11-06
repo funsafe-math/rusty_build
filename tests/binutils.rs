@@ -1,147 +1,211 @@
 use rusty_make::{
-    input::SourceCommand,
-    job::ExecutionStrategy,
-    parse_plan,
+    commands::{ar::Ar, nm::Nm, objcopy::Objcopy},
+    graph::create_graph,
+    job::{Access, FileAccess},
+    parse,
     registry::Registry,
-    scheduler::{RunOptions, run},
+    scheduler::execute,
 };
-use std::{fs, path::Path, process::Command};
+use std::{any::Any, fs, process::Command};
 
-fn source(text: &str) -> SourceCommand {
-    SourceCommand {
-        line: 1,
-        text: text.into(),
-        target: None,
-    }
-}
 fn available(tools: &[&str]) -> bool {
-    for tool in tools {
-        if Command::new(tool).arg("--version").output().is_err() {
-            eprintln!("skipping unavailable binary tool: {tool}");
-            return false;
+    tools.iter().all(|tool| {
+        let found = Command::new(tool).arg("--version").output().is_ok();
+        if !found {
+            eprintln!("skipping unavailable tool {tool}");
         }
-    }
-    true
-}
-fn object(root: &Path) {
-    fs::write(root.join("value.c"), "const char *marker = \"rusty_binary_tool_marker\";\nint exported_value(void) { return 7; }\n").unwrap();
-    let result = Command::new("cc")
-        .current_dir(root)
-        .args(["-g", "-c", "value.c", "-o", "input.o"])
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+        found
+    })
 }
 
 #[test]
-fn identifies_gnu_llvm_cross_and_absolute_tool_names_without_flag_parsing() {
+fn registers_exact_gnu_and_llvm_names_without_regex_matching() {
     let registry = Registry::default();
-    for tool in [
+    for executable in [
         "nm",
+        "gcc-nm",
+        "llvm-nm",
         "objdump",
+        "llvm-objdump",
         "readelf",
+        "llvm-readelf",
         "size",
+        "llvm-size",
         "strings",
+        "llvm-strings",
         "addr2line",
+        "llvm-addr2line",
         "c++filt",
+        "llvm-cxxfilt",
         "objcopy",
+        "llvm-objcopy",
         "strip",
+        "llvm-strip",
         "ar",
+        "gcc-ar",
+        "llvm-ar",
         "ranlib",
+        "gcc-ranlib",
+        "llvm-ranlib",
         "as",
+        "llvm-as",
         "ld",
+        "ld.bfd",
+        "ld.gold",
+        "ld.lld",
+        "lld-link",
         "elfedit",
         "dwp",
+        "llvm-dwp",
         "readobj",
+        "llvm-readobj",
         "dwarfdump",
+        "llvm-dwarfdump",
         "symbolizer",
+        "llvm-symbolizer",
     ] {
-        for program in [
-            tool.to_owned(),
-            format!("/usr/bin/{tool}"),
-            format!("arm-none-eabi-{tool}"),
-            format!("llvm-{tool}-18"),
-        ] {
-            let text = format!("{program} --future-option=value input.o > 'tool report.txt'");
-            let job = registry.classify(source(&text)).unwrap();
-            assert_eq!(job.spec.kind, tool, "{text}");
-            assert_eq!(job.strategy, ExecutionStrategy::External);
-            assert!(job.spec.unknown_effects && !job.spec.cacheable);
-            assert_eq!(
-                job.shell.as_ref().unwrap().args,
-                vec!["--future-option=value", "input.o"]
-            );
-            assert_eq!(
-                job.spec.outputs,
-                vec![std::path::PathBuf::from("tool report.txt")]
-            );
-        }
-    }
-    for (text, kind) in [
-        ("'tools with spaces/llvm-objdump-18' -h input.o", "objdump"),
-        ("llvm-cxxfilt _Z3foov", "c++filt"),
-        ("x86_64-linux-gnu-ld.bfd input.o", "ld"),
-        ("ld.lld input.o", "ld"),
-        ("aarch64-none-elf-nm.exe input.o", "nm"),
-    ] {
-        assert_eq!(registry.classify(source(text)).unwrap().spec.kind, kind);
-    }
-    for text in [
-        "nm-wrapper input.o",
-        "objdump_extra input.o",
-        "notnm input.o",
-    ] {
-        assert_eq!(
-            registry.classify(source(text)).unwrap().spec.kind,
-            "unknown"
+        let jobs = parse(
+            &format!("{executable} --future-option input.o > report"),
+            &registry,
+        )
+        .unwrap();
+        assert!(jobs[0].data().unknown_effects, "{executable}");
+        assert!(
+            jobs[0]
+                .data()
+                .accesses
+                .contains(&FileAccess::write("report"))
         );
     }
+    let jobs = parse("/usr/bin/nm input.o", &registry).unwrap();
+    let job = (jobs[0].as_ref() as &dyn Any).downcast_ref::<Nm>().unwrap();
+    assert_eq!(job.argv, ["/usr/bin/nm", "input.o"]);
+    for executable in ["nm-wrapper", "arm-none-eabi-nm", "llvm-nm-18"] {
+        assert!(parse(&format!("{executable} input.o"), &registry).is_err());
+    }
+    let mut custom = Registry::empty();
+    custom
+        .register(&["arm-none-eabi-nm"], |argv, hints| {
+            Ok(Some(Box::new(Nm::parse(argv, hints)?)))
+        })
+        .unwrap();
+    let jobs = parse("arm-none-eabi-nm input.o", &custom).unwrap();
+    let job = (jobs[0].as_ref() as &dyn Any).downcast_ref::<Nm>().unwrap();
+    assert_eq!(job.argv, ["arm-none-eabi-nm", "input.o"]);
 }
 
 #[test]
-fn file_redirections_keep_declared_effects_and_opaque_descriptor_ordering() {
+fn supported_arguments_describe_real_reads_and_writes() {
     let registry = Registry::default();
-    let append = registry
-        .classify(source("nm input.o >> symbols.txt"))
-        .unwrap();
+    for (command, expected) in [
+        ("nm -C input.o", vec![FileAccess::read("input.o")]),
+        ("nm", vec![FileAccess::read("a.out")]),
+        ("objdump -h input.o", vec![FileAccess::read("input.o")]),
+        ("readelf -h input.o", vec![FileAccess::read("input.o")]),
+        ("size -A input.o", vec![FileAccess::read("input.o")]),
+        ("strings -n 8 input.o", vec![FileAccess::read("input.o")]),
+        ("c++filt _Z3foov", vec![]),
+        (
+            "objcopy input.o output.o",
+            vec![FileAccess::read("input.o"), FileAccess::write("output.o")],
+        ),
+        ("objcopy input.o", vec![FileAccess::read_write("input.o")]),
+        (
+            "strip --strip-debug input.o",
+            vec![FileAccess::read_write("input.o")],
+        ),
+        (
+            "strip -o output.o input.o",
+            vec![FileAccess::read("input.o"), FileAccess::write("output.o")],
+        ),
+        (
+            "ranlib library.a",
+            vec![FileAccess::read_write("library.a")],
+        ),
+        (
+            "elfedit --output-osabi=GNU input.o",
+            vec![FileAccess::read_write("input.o")],
+        ),
+        (
+            "dwp -o package.dwp one.dwo",
+            vec![
+                FileAccess::read("one.dwo"),
+                FileAccess::write("package.dwp"),
+            ],
+        ),
+        (
+            "llvm-readobj --file-headers input.o",
+            vec![FileAccess::read("input.o")],
+        ),
+    ] {
+        let jobs = parse(command, &registry).unwrap();
+        assert!(!jobs[0].data().unknown_effects, "{command}");
+        assert_eq!(jobs[0].data().accesses, expected, "{command}");
+    }
+    let jobs = parse("ar rcs library.a one.o two.o", &registry).unwrap();
     assert_eq!(
-        append.spec.inputs,
-        vec![
-            std::path::PathBuf::from("input.o"),
-            std::path::PathBuf::from("symbols.txt")
+        jobs[0].data().accesses,
+        [
+            FileAccess::read_write("library.a"),
+            FileAccess::read("one.o"),
+            FileAccess::read("two.o")
         ]
     );
-    assert_eq!(
-        append.spec.outputs,
-        vec![std::path::PathBuf::from("symbols.txt")]
-    );
-    assert!(append.shell.unwrap().append_stdout);
-    let stderr = registry
-        .classify(source("objdump --bad 2> errors.txt"))
-        .unwrap();
-    assert_eq!(
-        stderr.spec.outputs,
-        vec![std::path::PathBuf::from("errors.txt")]
-    );
-    let stdin = registry.classify(source("c++filt < names.txt")).unwrap();
-    assert_eq!(
-        stdin.spec.inputs,
-        vec![std::path::PathBuf::from("names.txt")]
-    );
-    let opaque = registry
-        .classify(source("nm input.o > both.txt 2>&1"))
-        .unwrap();
-    assert_eq!(opaque.spec.kind, "nm");
-    assert!(opaque.shell.is_none());
-    assert!(opaque.spec.unknown_effects);
+    assert!((jobs[0].as_ref() as &dyn Any).is::<Ar>());
 }
 
 #[test]
-fn real_inspection_tools_redirect_and_append_exactly_their_output() {
+fn hidden_inputs_remain_unknown_and_original_argv_is_retained() {
+    let registry = Registry::default();
+    for command in [
+        "nm --plugin=plugin.so input.o",
+        "nm @options",
+        "nm -- @options",
+        "objdump -S input.o",
+        "objdump -d input.o",
+        "readelf --process-links input.o",
+        "addr2line -e input.o 0",
+        "as -o output.o input.s",
+        "ld -r -o output.o input.o",
+        "ar rcT library.a input.o",
+        "ar x library.a",
+        "llvm-symbolizer --obj=input.o 0",
+        "llvm-dwarfdump input.o",
+        "dwp -e app -o out.dwp",
+        "strings",
+    ] {
+        assert!(
+            parse(command, &registry).unwrap()[0].data().unknown_effects,
+            "{command}"
+        );
+    }
+    let jobs = parse(
+        "objcopy --future-option 'literal value' input.o > output",
+        &registry,
+    )
+    .unwrap();
+    let job = (jobs[0].as_ref() as &dyn Any)
+        .downcast_ref::<Objcopy>()
+        .unwrap();
+    assert_eq!(
+        job.argv,
+        ["objcopy", "--future-option", "literal value", "input.o"]
+    );
+    assert_eq!(job.data.shell.stdout.as_deref(), Some("output"));
+}
+
+#[test]
+fn thin_archive_discovery_keeps_explicit_inputs_but_marks_hidden_members() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = format!("{}/thin.a", root.path().display());
+    fs::write(&archive, b"!<thin>\n").unwrap();
+    let jobs = parse(&format!("nm '{archive}'"), &Registry::default()).unwrap();
+    assert!(jobs[0].data().unknown_effects);
+    assert_eq!(jobs[0].data().accesses, [FileAccess::read(archive)]);
+}
+
+#[test]
+fn installed_inspection_tools_execute_and_redirect_their_exact_output() {
     if !available(&[
         "cc",
         "nm",
@@ -155,143 +219,128 @@ fn real_inspection_tools_redirect_and_append_exactly_their_output() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    object(p);
-    for (tool, args, file) in [
-        ("nm", vec!["--defined-only", "input.o"], "symbols.txt"),
-        ("objdump", vec!["-h", "input.o"], "sections.txt"),
-        ("readelf", vec!["-h", "input.o"], "headers.txt"),
-        ("size", vec!["input.o"], "size.txt"),
-        ("strings", vec!["input.o"], "strings.txt"),
-        ("addr2line", vec!["-e", "input.o", "0"], "lines.txt"),
+    let source = format!("{}/value.c", root.path().display());
+    let object = format!("{}/input.o", root.path().display());
+    fs::write(
+        &source,
+        "const char *marker = \"rusty_binary_marker\";\nint exported_value(void) { return 7; }\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-g", "-c", &source, "-o", &object])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for (tool, args) in [
+        ("nm", vec!["--defined-only", object.as_str()]),
+        ("objdump", vec!["-h", object.as_str()]),
+        ("readelf", vec!["-h", object.as_str()]),
+        ("size", vec![object.as_str()]),
+        ("strings", vec![object.as_str()]),
+        ("addr2line", vec!["-e", object.as_str(), "0"]),
+        ("c++filt", vec!["_Z3foov"]),
     ] {
-        let reference = Command::new(tool)
-            .args(&args)
-            .current_dir(p)
-            .output()
-            .unwrap();
+        let reference = Command::new(tool).args(&args).output().unwrap();
         assert!(reference.status.success());
-        fs::write(p.join(file), "stale content that must be truncated").unwrap();
-        let text = format!("{tool} {} > {file}\n", args.join(" "));
-        let graph = parse_plan(&text, p, &Registry::default()).unwrap();
-        run(
-            &graph,
-            &RunOptions {
-                jobs: 4,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(fs::read(p.join(file)).unwrap(), reference.stdout, "{tool}");
+        let output = format!("{}/{tool}.txt", root.path().display());
+        fs::write(&output, "stale content").unwrap();
+        let command = format!(
+            "{tool} {} > '{output}'",
+            args.iter()
+                .map(|arg| format!("'{arg}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let dag = create_graph(parse(&command, &Registry::default()).unwrap()).unwrap();
+        dag.check_inputs().unwrap();
+        execute(&dag, false).unwrap();
+        assert_eq!(fs::read(output).unwrap(), reference.stdout, "{tool}");
     }
-    let reference = Command::new("nm")
-        .args(["--defined-only", "input.o"])
-        .current_dir(p)
-        .output()
-        .unwrap()
-        .stdout;
-    let graph = parse_plan(
-        "nm --defined-only input.o >> symbols.txt\n",
-        p,
-        &Registry::default(),
-    )
-    .unwrap();
-    run(&graph, &RunOptions::default()).unwrap();
-    assert_eq!(
-        fs::read(p.join("symbols.txt")).unwrap(),
-        [reference.as_slice(), reference.as_slice()].concat()
-    );
-    fs::write(p.join("mangled names.txt"), "_Z3foov\n").unwrap();
-    let graph = parse_plan(
-        "c++filt < 'mangled names.txt' > 'demangled names.txt'\n",
-        p,
-        &Registry::default(),
-    )
-    .unwrap();
-    run(&graph, &RunOptions::default()).unwrap();
-    assert_eq!(
-        fs::read_to_string(p.join("demangled names.txt")).unwrap(),
-        "foo()\n"
-    );
 }
 
 #[test]
-fn real_mutating_tools_preserve_order_and_allow_file_redirection() {
-    if !available(&["cc", "ar", "ranlib", "nm", "objcopy", "strip", "objdump"]) {
+fn installed_archive_and_mutating_tools_preserve_real_file_effects() {
+    if !available(&["cc", "ar", "ranlib", "nm", "objcopy", "strip", "readelf"]) {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    object(p);
-    let text = "ar rcs library.a input.o > archive.log\nranlib library.a > ranlib.log\nnm library.a > archive-symbols.txt\nobjcopy --only-section=.text input.o code.o > objcopy.log\nstrip --strip-debug code.o > strip.log\nobjdump -h code.o > code-sections.txt\n";
-    let graph = parse_plan(text, p, &Registry::default()).unwrap();
-    let report = run(
-        &graph,
-        &RunOptions {
-            jobs: 4,
-            ..Default::default()
-        },
+    let p = root.path().display();
+    fs::write(
+        format!("{p}/value.c"),
+        "int exported_value(void) { return 7; }\n",
     )
     .unwrap();
-    assert_eq!(report.executed, 6);
     assert!(
-        fs::read_to_string(p.join("archive-symbols.txt"))
+        Command::new("cc")
+            .args([
+                "-g",
+                "-c",
+                &format!("{p}/value.c"),
+                "-o",
+                &format!("{p}/input.o")
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let text = format!(
+        "ar rcs '{p}/library.a' '{p}/input.o'\nranlib '{p}/library.a'\nnm '{p}/library.a' > '{p}/symbols'\nobjcopy --only-section=.text '{p}/input.o' '{p}/code.o'\nstrip --strip-debug '{p}/code.o'\nreadelf -S '{p}/code.o' > '{p}/sections'"
+    );
+    let dag = create_graph(parse(&text, &Registry::default()).unwrap()).unwrap();
+    dag.check_inputs().unwrap();
+    execute(&dag, false).unwrap();
+    assert!(
+        fs::read_to_string(format!("{p}/symbols"))
             .unwrap()
             .contains("exported_value")
     );
     assert!(
-        fs::read_to_string(p.join("code-sections.txt"))
+        fs::read_to_string(format!("{p}/sections"))
             .unwrap()
             .contains(".text")
     );
-    for file in ["archive.log", "ranlib.log", "objcopy.log", "strip.log"] {
-        assert_eq!(fs::read(p.join(file)).unwrap(), b"");
-    }
+    assert!(
+        dag.jobs
+            .iter()
+            .flat_map(|job| &job.data().accesses)
+            .any(|access| access.access == Access::ReadWrite)
+    );
 }
 
 #[test]
-fn tool_errors_redirect_stderr_and_do_not_start_dependents() {
-    if !available(&["nm"]) {
+fn installed_llvm_aliases_execute_their_original_invocations() {
+    if !available(&["cc", "llvm-ar", "llvm-nm", "llvm-objcopy", "llvm-readobj"]) {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    let reference = Command::new("nm")
-        .args(["--rusty-make-invalid-option"])
-        .current_dir(p)
-        .output()
-        .unwrap();
-    assert!(!reference.status.success());
-    let graph = parse_plan(
-        "nm --rusty-make-invalid-option > stdout.txt 2> stderr.txt\ntouch never-started\n",
-        p,
-        &Registry::default(),
+    let p = root.path().display();
+    fs::write(
+        format!("{p}/input.c"),
+        "int llvm_export(void) { return 9; }\n",
     )
     .unwrap();
-    assert!(run(&graph, &RunOptions::default()).is_err());
-    assert_eq!(fs::read(p.join("stdout.txt")).unwrap(), reference.stdout);
-    assert_eq!(fs::read(p.join("stderr.txt")).unwrap(), reference.stderr);
-    assert!(!p.join("never-started").exists());
-    let graph = parse_plan(
-        "nm --rusty-make-invalid-option > combined.txt 2>&1\n",
-        p,
-        &Registry::default(),
-    )
-    .unwrap();
-    assert!(run(&graph, &RunOptions::default()).is_err());
-    assert_eq!(
-        fs::read(p.join("combined.txt")).unwrap(),
-        [reference.stdout.as_slice(), reference.stderr.as_slice()].concat()
+    assert!(
+        Command::new("cc")
+            .args(["-c", &format!("{p}/input.c"), "-o", &format!("{p}/input.o")])
+            .status()
+            .unwrap()
+            .success()
     );
-    let graph = parse_plan(
-        "nm --rusty-make-invalid-option 2>> stderr.txt\n",
-        p,
-        &Registry::default(),
-    )
-    .unwrap();
-    assert!(run(&graph, &RunOptions::default()).is_err());
-    assert_eq!(
-        fs::read(p.join("stderr.txt")).unwrap(),
-        [reference.stderr.as_slice(), reference.stderr.as_slice()].concat()
+    let text = format!(
+        "llvm-ar rcs '{p}/library.a' '{p}/input.o'\nllvm-nm --defined-only '{p}/library.a' > '{p}/symbols'\nllvm-objcopy '{p}/input.o' '{p}/copy.o'\nllvm-readobj --file-headers '{p}/copy.o' > '{p}/header'"
+    );
+    let dag = create_graph(parse(&text, &Registry::default()).unwrap()).unwrap();
+    execute(&dag, false).unwrap();
+    assert!(
+        fs::read_to_string(format!("{p}/symbols"))
+            .unwrap()
+            .contains("llvm_export")
+    );
+    assert!(
+        fs::read_to_string(format!("{p}/header"))
+            .unwrap()
+            .contains("Format:")
     );
 }

@@ -1,250 +1,107 @@
-//! GNU Make dry-run log ingestion with Bash, not cmd.exe, recipe semantics.
-//!
-//! Physical source line numbers and command spelling are retained. Only an
-//! active Bash backslash-newline joins physical lines; open quotes, here-docs,
-//! and compound statements are not implicitly assembled across log records.
-//! Make trace lines attach target metadata to subsequent recipes. Diagnostics
-//! never become commands, and failed Make logs or directory-scoped recipes are
-//! rejected before execution. CRLF physical delimiters, including active
-//! backslash-CRLF continuations, are normalized to LF without changing literal
-//! backslashes or physical source line numbers.
-
+use crate::shell::{self, ParsedLine};
 use anyhow::{Context, Result, bail};
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::{ops::Deref, sync::LazyLock};
 
-use crate::shell::{self, ShellCommand};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SourceCommand {
-    pub line: usize,
-    pub text: String,
-    pub target: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SourceDiagnostic {
-    /// None denotes a planner warning, not a physical input record.
-    pub line: Option<usize>,
-    pub text: String,
-}
-
-/// A validated source record and its single shell parse.
-///
-/// Source access is immutable, preventing a cached argv from outliving edits to
-/// its source spelling. To classify changed text, construct a `SourceCommand`
-/// and pass it to `Registry::classify`, which validates it afresh.
-#[derive(Clone, Debug)]
-pub struct ParsedCommand {
-    source: SourceCommand,
-    shell: Option<ShellCommand>,
-}
-
-impl ParsedCommand {
-    pub fn source(&self) -> &SourceCommand {
-        &self.source
-    }
-
-    pub fn shell(&self) -> Option<&ShellCommand> {
-        self.shell.as_ref()
-    }
-
-    pub(crate) fn into_parts(self) -> (SourceCommand, Option<ShellCommand>) {
-        (self.source, self.shell)
-    }
-}
-
-impl Deref for ParsedCommand {
-    type Target = SourceCommand;
-
-    fn deref(&self) -> &SourceCommand {
-        &self.source
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct InputLog {
-    commands: Vec<ParsedCommand>,
-    pub diagnostics: Vec<SourceDiagnostic>,
-}
-
-impl InputLog {
-    /// Validated records are immutable, so their parsed argv cannot become stale.
-    pub fn commands(&self) -> &[ParsedCommand] {
-        &self.commands
-    }
-
-    pub(crate) fn into_parts(self) -> (Vec<ParsedCommand>, Vec<SourceDiagnostic>) {
-        (self.commands, self.diagnostics)
-    }
-}
-
-static TRACE_UPDATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^.+:[0-9]+: update target ['`](.*)' due to:.*$").unwrap());
-static TRACE_MISSING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^.+:[0-9]+: target ['`](.*)' does not exist$").unwrap());
-static MAKE_DIAGNOSTIC: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:.*[/\\])?(?:g?make)(?:\[[0-9]+\])?: (.*)$").unwrap());
-static FILE_DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^.+:[0-9]+(?::[0-9]+)?: (?:warning:|note:|\*\*\*|warning[ :]).*$").unwrap()
-});
-
-/// Read complete dry-run records; never recover by accepting a command prefix.
-pub fn read_log(text: &str) -> Result<InputLog> {
-    let mut log = InputLog {
-        commands: Vec::new(),
-        diagnostics: Vec::new(),
-    };
-    let mut target = None;
-    let mut pending: Option<SourceCommand> = None;
-    let mut quote = Quote::Unquoted;
-    let mut directory_depth = 0usize;
-
+/// Read physical lines and join only active backslash-newline continuations.
+/// Paths and command spelling are not normalized; CRLF is a record delimiter.
+pub fn read_log(text: &str) -> Result<Vec<ParsedLine>> {
+    let mut commands = Vec::new();
+    let mut pending = String::new();
+    let mut start = 1;
+    let mut quote = None;
     for (index, physical) in text.split_inclusive('\n').enumerate() {
         let line_number = index + 1;
         let has_newline = physical.ends_with('\n');
-        let without_newline = physical.strip_suffix('\n').unwrap_or(physical);
-        let crlf = has_newline && without_newline.ends_with('\r');
-        let line = if crlf {
-            &without_newline[..without_newline.len() - 1]
+        let line = physical.strip_suffix('\n').unwrap_or(physical);
+        let line = if has_newline {
+            line.strip_suffix('\r').unwrap_or(line)
         } else {
-            without_newline
+            line
         };
-        let metadata = classify_metadata(line);
-        if pending.is_some() && metadata.is_some() {
-            bail!("Make metadata interrupts a shell continuation at source line {line_number}");
-        }
-        if let Some(metadata) = metadata {
-            match metadata {
-                Metadata::Trace(next_target) => target = Some(next_target),
-                Metadata::Diagnostic(message) => {
-                    if message.contains("***")
-                        || message.starts_with("No rule to make target ")
-                        || message.ends_with(" Stop.")
-                    {
-                        bail!("failed Make log at source line {line_number}: {line}");
-                    }
-                    if message.starts_with("Entering directory ") {
-                        directory_depth += 1;
-                        target = None;
-                    } else if message.starts_with("Leaving directory ") {
-                        directory_depth = directory_depth.saturating_sub(1);
-                        target = None;
-                    }
-                }
+        if pending.is_empty() {
+            start = line_number;
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
             }
-            log.diagnostics.push(SourceDiagnostic {
-                line: Some(line_number),
-                text: line.to_owned(),
-            });
-            continue;
-        }
-        if pending.is_none() && (line.trim().is_empty() || line.trim_start().starts_with('#')) {
-            continue;
-        }
-        if directory_depth != 0 {
-            bail!(
-                "directory-scoped Make recipe at source line {line_number} cannot be replayed safely: logs do not carry a command working directory"
-            );
+            if metadata(line)? {
+                continue;
+            }
         }
         let continued = active_continuation(line, &mut quote);
-        let mut command = pending.take().unwrap_or_else(|| SourceCommand {
-            line: line_number,
-            text: String::new(),
-            target: target.clone(),
-        });
-        command.text.push_str(line);
+        pending.push_str(line);
         if continued {
             if !has_newline {
-                bail!("incomplete shell continuation at source line {line_number}");
+                bail!("unfinished continuation on line {line_number}");
             }
-            command.text.push('\n');
-            pending = Some(command);
+            pending.push('\n');
             continue;
         }
-        let parsed = shell::parse(&command.text)
-            .with_context(|| format!("invalid shell command at source line {}", command.line))?;
-        log.commands.push(ParsedCommand {
-            source: command,
-            shell: parsed,
-        });
-        quote = Quote::Unquoted;
+        let mut command =
+            shell::parse(&pending).with_context(|| format!("command on line {start}"))?;
+        command.line = start;
+        commands.push(command);
+        pending.clear();
+        quote = None;
     }
-    if let Some(command) = pending {
-        bail!(
-            "incomplete shell continuation starting at source line {}",
-            command.line
-        );
+    if !pending.is_empty() {
+        bail!("unfinished continuation on line {start}");
     }
-    Ok(log)
+    Ok(commands)
 }
 
-enum Metadata<'a> {
-    Trace(String),
-    Diagnostic(&'a str),
-}
-
-fn classify_metadata(line: &str) -> Option<Metadata<'_>> {
-    for pattern in [&*TRACE_UPDATE, &*TRACE_MISSING] {
-        if let Some(captures) = pattern.captures(line) {
-            return Some(Metadata::Trace(captures[1].to_owned()));
+// Trace/diagnostic records are not commands. Directory-changing recursive Make
+// output cannot be replayed without changing the meaning of relative operands.
+fn metadata(line: &str) -> Result<bool> {
+    let Some((prefix, message)) = line.split_once(": ") else {
+        return Ok(false);
+    };
+    let program = prefix.rsplit('/').next().unwrap_or(prefix);
+    if program == "make"
+        || program == "gmake"
+        || program.starts_with("make[")
+        || program.starts_with("gmake[")
+    {
+        if message.contains("***") || message.starts_with("No rule to make target") {
+            bail!("failed Make log: {line}");
         }
+        if message.starts_with("Entering directory") || message.starts_with("Leaving directory") {
+            bail!("directory-changing Make logs are unsupported: {line}");
+        }
+        return Ok(true);
     }
-    if let Some(captures) = MAKE_DIAGNOSTIC.captures(line) {
-        return Some(Metadata::Diagnostic(captures.get(1).unwrap().as_str()));
-    }
-    if FILE_DIAGNOSTIC.is_match(line) {
-        return Some(Metadata::Diagnostic(line));
-    }
-    None
+    let numbered = prefix
+        .rsplit_once(':')
+        .is_some_and(|(_, number)| number.parse::<usize>().is_ok());
+    Ok(numbered
+        && (message.starts_with("update target ")
+            || message.starts_with("target ")
+            || message.starts_with("warning:")
+            || message.starts_with("note:")))
 }
 
-#[derive(Clone, Copy)]
-enum Quote {
-    Unquoted,
-    Single,
-    Double,
-}
-
-/// Return whether the final backslash escapes the physical line boundary.
-/// Comments and single quotes make backslashes literal. Quote state crosses a
-/// record boundary only when that boundary is an explicit continuation.
-fn active_continuation(line: &str, quote: &mut Quote) -> bool {
+fn active_continuation(line: &str, quote: &mut Option<char>) -> bool {
     let mut escaped = false;
-    let mut word_start = matches!(quote, Quote::Unquoted);
+    let mut word_start = quote.is_none();
     for ch in line.chars() {
         if escaped {
             escaped = false;
             continue;
         }
-        match quote {
-            Quote::Single => {
-                if ch == '\'' {
-                    *quote = Quote::Unquoted;
-                }
+        match (*quote, ch) {
+            (Some('\''), '\'') => *quote = None,
+            (Some('\''), _) => {}
+            (Some('"'), '"') => *quote = None,
+            (Some('"'), '\\') => escaped = true,
+            (Some('"'), _) => {}
+            (None, '#') if word_start => return false,
+            (None, '\'' | '"') => {
+                *quote = Some(ch);
+                word_start = false;
             }
-            Quote::Double => match ch {
-                '"' => *quote = Quote::Unquoted,
-                '\\' => escaped = true,
-                _ => {}
-            },
-            Quote::Unquoted => match ch {
-                '#' if word_start => return false,
-                '\'' => {
-                    *quote = Quote::Single;
-                    word_start = false;
-                }
-                '"' => {
-                    *quote = Quote::Double;
-                    word_start = false;
-                }
-                '\\' => {
-                    escaped = true;
-                    word_start = false;
-                }
-                _ => word_start = ch.is_whitespace() || ";&|()<>".contains(ch),
-            },
+            (None, '\\') => {
+                escaped = true;
+                word_start = false;
+            }
+            _ => word_start = ch.is_whitespace() || ";&|()<>".contains(ch),
         }
     }
     escaped
@@ -255,131 +112,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_plain_commands_with_exact_source_locations() {
-        let log = read_log("\n# build\n  cc -c a.c -o a.o\nprintf '%s' 'done'\n").unwrap();
-        assert_eq!(log.commands.len(), 2);
-        assert_eq!(log.commands[0].line, 3);
-        assert_eq!(log.commands[0].text, "  cc -c a.c -o a.o");
-        assert_eq!(log.commands[1].line, 4);
-        assert!(log.commands[0].target.is_none());
+    fn crlf_continuations_preserve_words_and_physical_lines() {
+        let log = read_log("cp se\\\r\ned result\r\ncp 'a b' 'c d'\r\n").unwrap();
+        assert_eq!(log[0].argv, ["cp", "seed", "result"]);
+        assert_eq!(log[1].line, 3);
+        assert_eq!(log[1].argv, ["cp", "a b", "c d"]);
     }
 
     #[test]
-    fn reads_representative_gnu_make_trace() {
-        let text = "Makefile:4: update target 'build/a.o' due to: src/a.c include/a.h\ncc -Iinclude -c src/a.c -o build/a.o\nMakefile:7: target 'all' does not exist\nprintf '%s\\n' done\nmake: Nothing to be done for 'extra'.\n";
-        let log = read_log(text).unwrap();
-        assert_eq!(log.commands.len(), 2);
-        assert_eq!(log.commands[0].line, 2);
-        assert_eq!(log.commands[0].target.as_deref(), Some("build/a.o"));
-        assert_eq!(log.commands[1].target.as_deref(), Some("all"));
-        assert_eq!(log.diagnostics.len(), 3);
-        assert_eq!(log.diagnostics[0].text, text.lines().next().unwrap());
-        assert_eq!(
-            log.diagnostics.iter().map(|d| d.line).collect::<Vec<_>>(),
-            vec![Some(1), Some(3), Some(5)]
-        );
-    }
-
-    #[test]
-    fn trace_target_handles_spaces_apostrophes_and_windows_drive_prefix() {
-        let log = read_log(
-            "C:/work/Makefile:123: update target 'it's a target.o' due to: a.c\ncc -c a.c\n",
-        )
-        .unwrap();
-        assert_eq!(log.commands[0].target.as_deref(), Some("it's a target.o"));
-        let log = read_log("Makefile:1: target `old quoting' does not exist\necho ok\n").unwrap();
-        assert_eq!(log.commands[0].target.as_deref(), Some("old quoting"));
-    }
-
-    #[test]
-    fn diagnostics_are_not_shell_commands() {
-        let log = read_log("make: 'all' is up to date.\nmake[1]: Nothing to be done for 'all'.\nMakefile:4: warning: overriding recipe for target 'x'\nMakefile:3: warning: ignoring old recipe for target 'x'\n/usr/bin/gmake: Nothing to be done for 'all'.\n").unwrap();
-        assert!(log.commands.is_empty());
-        assert_eq!(log.diagnostics.len(), 5);
-        assert!(
-            read_log(
-                "make[1]: Entering directory '/tmp/sub'\nmake[1]: Leaving directory '/tmp/sub'\n"
-            )
-            .unwrap()
-            .commands
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn rejects_failed_make_logs_and_directory_scoped_recipes() {
-        for text in [
-            "echo partial\nmake: *** [Makefile:2: all] Error 1\n",
-            "make: *** No rule to make target 'missing'. Stop.\n",
-            "Makefile:2: *** missing separator. Stop.\n",
-            "make[1]: Entering directory '/tmp/sub'\nMakefile:1: target 'x' does not exist\necho wrong-cwd\n",
-        ] {
-            assert!(read_log(text).is_err(), "must reject unsafe log: {text}");
-        }
-    }
-
-    #[test]
-    fn preserves_logical_continuations_and_starting_line() {
-        let text = "Makefile:2: target 'x' does not exist\ncc -c \\\n  'source file.c' \\\n  -o out.o\necho done\n";
-        let log = read_log(text).unwrap();
-        assert_eq!(log.commands.len(), 2);
-        assert_eq!(log.commands[0].line, 2);
-        assert_eq!(
-            log.commands[0].text,
-            "cc -c \\\n  'source file.c' \\\n  -o out.o"
-        );
-        assert_eq!(log.commands[0].target.as_deref(), Some("x"));
-        assert_eq!(log.commands[1].line, 5);
-        let log = read_log("echo \"ab\\\ncd\"\n").unwrap();
-        assert_eq!(log.commands[0].text, "echo \"ab\\\ncd\"");
-    }
-
-    #[test]
-    fn continuation_detection_respects_quotes_comments_and_even_escapes() {
-        let log = read_log("echo 'literal\\'\necho ok # comment\\\necho last\n").unwrap();
-        assert_eq!(log.commands.len(), 3);
-        let log = read_log("echo two\\\\\necho next\n").unwrap();
-        assert_eq!(log.commands.len(), 2);
-        let log = read_log("echo foo#not-comment\\\nbar\n").unwrap();
-        assert_eq!(log.commands.len(), 1);
-    }
-
-    #[test]
-    fn rejects_implicit_multiline_and_unfinished_continuations() {
-        for text in [
-            "echo 'first\nsecond'\n",
-            "echo \"first\nsecond\"\n",
-            "cat <<EOF\nbody\nEOF\n",
-            "if true; then\necho yes\nfi\n",
-            "echo x &&\necho y\n",
-            "echo trailing\\",
-            "echo trailing\\\n",
-            "echo x \\\nMakefile:2: target 'next' does not exist\necho next\n",
-            "echo \0bad\n",
-        ] {
-            assert!(
-                read_log(text).is_err(),
-                "must reject unsafe multiline log: {text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn valid_complex_single_line_is_preserved_for_bash() {
-        let log =
-            read_log("cd build && cc -c a.c -o a.o\nfor x in a b; do echo \"$x\"; done\n").unwrap();
-        assert_eq!(log.commands.len(), 2);
-        assert_eq!(log.commands[0].text, "cd build && cc -c a.c -o a.o");
-        assert_eq!(log.commands[1].line, 2);
-    }
-
-    #[test]
-    fn crlf_records_do_not_change_windows_path_spelling() {
-        let text = "tool 'C:\\work\\foo.c'\r\ntool C:\\work\\foo.c\r\n";
-        let log = read_log(text).unwrap();
-        assert_eq!(log.commands[0].text, "tool 'C:\\work\\foo.c'");
-        assert_eq!(log.commands[1].text, "tool C:\\work\\foo.c");
-        assert_eq!(log.commands()[0].shell().unwrap().args, [r"C:\work\foo.c"]);
-        assert_eq!(log.commands()[1].shell().unwrap().args, ["C:workfoo.c"]);
+    fn all_lines_are_validated_before_exposing_jobs() {
+        assert!(read_log("touch prefix\ncp source target | other\n").is_err());
+        assert!(read_log("touch prefix\ncp \\\n").is_err());
+        assert!(read_log("make[1]: Entering directory 'other'\ntouch wrong\n").is_err());
     }
 }

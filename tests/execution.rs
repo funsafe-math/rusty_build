@@ -1,137 +1,254 @@
 use rusty_make::{
-    parse_plan,
-    registry::Registry,
-    rewrite::{CopyChain, GraphRewrite},
-    scheduler::{RunOptions, run},
+    graph::{Edge, create_graph},
+    job::{FileAccess, Job, JobData},
+    scheduler::execute,
 };
-use std::{fs, path::Path};
-fn hash(path: &Path) -> String {
-    blake3::hash(&fs::read(path).unwrap()).to_hex().to_string()
+use std::{any::Any, cell::RefCell, fs, rc::Rc};
+
+type Events = Rc<RefCell<Vec<String>>>;
+
+#[derive(Debug)]
+struct CopyFile {
+    data: JobData,
+    source: String,
+    destination: String,
+    events: Events,
 }
-#[test]
-fn independent_jobs_batch_and_dependent_jobs_wait() {
-    let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    fs::write(p.join("a"), "A").unwrap();
-    fs::write(p.join("b"), "B").unwrap();
-    let graph = parse_plan("cp a x\ncp b y\ncp x z\n", p, &Registry::default()).unwrap();
-    assert_eq!(graph.waves, vec![vec![0, 1], vec![2]]);
-    let report = run(
-        &graph,
-        &RunOptions {
-            jobs: 4,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(report.executed, 3);
-    assert_eq!(report.batches, 2);
-    assert_eq!(fs::read_to_string(p.join("z")).unwrap(), "A");
-    assert_eq!(fs::read_to_string(p.join("y")).unwrap(), "B");
+impl Job for CopyFile {
+    fn data(&self) -> &JobData {
+        &self.data
+    }
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
+    }
+    fn execute(&self) -> anyhow::Result<()> {
+        fs::copy(&self.source, &self.destination)?;
+        self.events.borrow_mut().push(self.destination.clone());
+        Ok(())
+    }
 }
-#[test]
-fn different_types_remain_distinct_batches() {
-    let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    fs::write(p.join("a"), "A").unwrap();
-    let graph = parse_plan("cp a x\nmkdir -p independent\n", p, &Registry::default()).unwrap();
-    assert_eq!(graph.waves, vec![vec![0, 1]]);
-    let report = run(
-        &graph,
-        &RunOptions {
-            jobs: 2,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(report.batches, 2);
-    assert!(p.join("independent").is_dir());
-    assert_eq!(fs::read(p.join("x")).unwrap(), b"A");
+fn copy(source: String, destination: String, events: &Events) -> Box<dyn Job> {
+    Box::new(CopyFile {
+        data: JobData::new(vec![
+            FileAccess::read(source.clone()),
+            FileAccess::write(destination.clone()),
+        ]),
+        source,
+        destination,
+        events: events.clone(),
+    })
 }
+
 #[test]
-fn failure_prevents_dependent_work() {
+fn default_batch_executes_each_item_then_dependent_consumer() {
     let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    let graph = parse_plan(
-        "cp missing x\ncp x should-not-exist\n",
-        p,
-        &Registry::default(),
-    )
+    let path = |name| root.path().join(name).to_str().unwrap().to_owned();
+    fs::write(path("a"), "A").unwrap();
+    fs::write(path("b"), "B").unwrap();
+    let events = Events::default();
+    let dag = create_graph(vec![
+        copy(path("a"), path("x"), &events),
+        copy(path("b"), path("y"), &events),
+        copy(path("x"), path("z"), &events),
+    ])
     .unwrap();
-    assert!(
-        run(
-            &graph,
-            &RunOptions {
-                jobs: 4,
-                ..Default::default()
-            }
-        )
-        .is_err()
+    assert_eq!(dag.batches(), vec![vec![0, 1], vec![2]]);
+    execute(&dag, false).unwrap();
+    assert_eq!(*events.borrow(), vec![path("x"), path("y"), path("z")]);
+    assert_eq!(fs::read_to_string(path("z")).unwrap(), "A");
+    assert_eq!(fs::read_to_string(path("y")).unwrap(), "B");
+}
+
+#[derive(Debug)]
+struct BatchItem {
+    data: JobData,
+    id: usize,
+    events: Events,
+}
+impl Job for BatchItem {
+    fn data(&self) -> &JobData {
+        &self.data
+    }
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
+    }
+    fn name(&self) -> &str {
+        "same-name"
+    }
+    fn execute(&self) -> anyhow::Result<()> {
+        anyhow::bail!("custom batch must be called")
+    }
+    fn execute_batch(&self, items: &[&dyn Job]) -> anyhow::Result<()> {
+        self.events.borrow_mut().push("batch:start".into());
+        for item in items {
+            let item = (*item as &dyn Any)
+                .downcast_ref::<Self>()
+                .expect("only same concrete type belongs in a batch");
+            self.events.borrow_mut().push(format!("batch:{}", item.id));
+        }
+        self.events.borrow_mut().push("batch:end".into());
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct OtherItem {
+    data: JobData,
+    id: usize,
+    events: Events,
+}
+impl Job for OtherItem {
+    fn data(&self) -> &JobData {
+        &self.data
+    }
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
+    }
+    fn name(&self) -> &str {
+        "same-name"
+    }
+    fn execute(&self) -> anyhow::Result<()> {
+        self.events.borrow_mut().push(format!("other:{}", self.id));
+        Ok(())
+    }
+}
+
+#[test]
+fn custom_batches_are_sequential_stable_and_grouped_by_concrete_any_type() {
+    let events = Events::default();
+    let dag = create_graph(vec![
+        Box::new(BatchItem {
+            data: JobData::new(vec![FileAccess::write("token")]),
+            id: 0,
+            events: events.clone(),
+        }) as Box<dyn Job>,
+        Box::new(OtherItem {
+            data: JobData::default(),
+            id: 1,
+            events: events.clone(),
+        }),
+        Box::new(BatchItem {
+            data: JobData::default(),
+            id: 2,
+            events: events.clone(),
+        }),
+        Box::new(OtherItem {
+            data: JobData::default(),
+            id: 3,
+            events: events.clone(),
+        }),
+        Box::new(BatchItem {
+            data: JobData::new(vec![FileAccess::read("token")]),
+            id: 4,
+            events: events.clone(),
+        }),
+    ])
+    .unwrap();
+    assert_eq!(dag.batches(), vec![vec![0, 2], vec![1, 3], vec![4]]);
+    execute(&dag, false).unwrap();
+    assert_eq!(
+        *events.borrow(),
+        vec![
+            "batch:start",
+            "batch:0",
+            "batch:2",
+            "batch:end",
+            "other:1",
+            "other:3",
+            "batch:start",
+            "batch:4",
+            "batch:end"
+        ]
     );
-    assert!(!p.join("should-not-exist").exists());
 }
-#[test]
-fn rewrite_preserves_intermediate_final_artifacts_and_later_consumers() {
-    let original = tempfile::tempdir().unwrap();
-    let optimized = tempfile::tempdir().unwrap();
-    let commands = "cp source intermediate\ncp intermediate final\ncp intermediate other\n";
-    for p in [original.path(), optimized.path()] {
-        fs::write(p.join("source"), "shared input\n").unwrap();
+
+#[derive(Debug)]
+struct FailingItem {
+    data: JobData,
+    id: usize,
+    fail: bool,
+    events: Events,
+}
+impl Job for FailingItem {
+    fn data(&self) -> &JobData {
+        &self.data
     }
-    let reference = parse_plan(commands, original.path(), &Registry::default()).unwrap();
-    run(&reference, &RunOptions::default()).unwrap();
-    let mut graph = parse_plan(commands, optimized.path(), &Registry::default()).unwrap();
-    let stats = CopyChain.apply(&mut graph).unwrap();
-    assert_eq!(stats.transformations, 1);
-    assert_eq!(graph.provenance[0].len(), 2);
-    run(
-        &graph,
-        &RunOptions {
-            jobs: 4,
-            ..Default::default()
-        },
-    )
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
+    }
+    fn execute(&self) -> anyhow::Result<()> {
+        self.events.borrow_mut().push(format!("item:{}", self.id));
+        if self.fail {
+            anyhow::bail!("deliberate failure");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn failure_stops_remaining_batch_items_and_all_later_batches() {
+    let events = Events::default();
+    let dag = create_graph(vec![
+        Box::new(FailingItem {
+            data: JobData::default(),
+            id: 0,
+            fail: true,
+            events: events.clone(),
+        }) as Box<dyn Job>,
+        Box::new(FailingItem {
+            data: JobData::default(),
+            id: 1,
+            fail: false,
+            events: events.clone(),
+        }),
+        Box::new(OtherItem {
+            data: JobData::default(),
+            id: 2,
+            events: events.clone(),
+        }),
+    ])
     .unwrap();
-    for name in ["source", "intermediate", "final", "other"] {
-        assert_eq!(
-            hash(&original.path().join(name)),
-            hash(&optimized.path().join(name))
-        );
-    }
-    let second = run(&graph, &RunOptions::default()).unwrap();
-    assert_eq!(second.skipped, 2);
+    assert!(execute(&dag, false).is_err());
+    assert_eq!(*events.borrow(), vec!["item:0"]);
 }
+
 #[test]
-fn rewrite_refuses_overwriting_original_source() {
+fn early_input_failure_prevents_even_independent_side_effects() {
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("a"), "A").unwrap();
-    let mut graph = parse_plan("cp a b\ncp b a\n", root.path(), &Registry::default()).unwrap();
-    assert_eq!(CopyChain.apply(&mut graph).unwrap().transformations, 0);
+    let events = Events::default();
+    let missing = root.path().join("missing").to_str().unwrap().to_owned();
+    let dag = create_graph(vec![
+        Box::new(OtherItem {
+            data: JobData::default(),
+            id: 0,
+            events: events.clone(),
+        }) as Box<dyn Job>,
+        copy(
+            missing,
+            root.path().join("out").to_str().unwrap().to_owned(),
+            &events,
+        ),
+    ])
+    .unwrap();
+    assert!(execute(&dag, false).is_err());
+    assert!(events.borrow().is_empty());
+    assert!(!root.path().join("out").exists());
 }
+
 #[test]
-fn copy_chain_existing_destination_preserves_sequential_behavior() {
-    let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    for (name, value) in [("a", "new"), ("b", "old-b"), ("c", "old-c")] {
-        fs::write(p.join(name), value).unwrap();
-    }
-    let mut graph = parse_plan("cp a b\ncp b c\n", p, &Registry::default()).unwrap();
-    CopyChain.apply(&mut graph).unwrap();
-    run(&graph, &RunOptions::default()).unwrap();
-    assert_eq!(fs::read_to_string(p.join("b")).unwrap(), "new");
-    assert_eq!(fs::read_to_string(p.join("c")).unwrap(), "new");
-}
-#[test]
-fn invalid_plan_does_not_execute_valid_prefix() {
-    let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    fs::write(p.join("a"), "A").unwrap();
-    fs::write(p.join("commands.txt"), "cp a b\ncp --unsupported b c\n").unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rusty_make"))
-        .current_dir(p)
-        .args(["--commands", "commands.txt"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(!p.join("b").exists());
+fn scheduler_revalidates_public_edges_before_input_checks_or_execution() {
+    let events = Events::default();
+    let mut dag = create_graph(vec![Box::new(OtherItem {
+        data: JobData::default(),
+        id: 0,
+        events: events.clone(),
+    }) as Box<dyn Job>])
+    .unwrap();
+    dag.edges.push(Edge { from: 0, to: 0 });
+    assert!(
+        execute(&dag, false)
+            .unwrap_err()
+            .to_string()
+            .contains("cycle")
+    );
+    assert!(events.borrow().is_empty());
 }

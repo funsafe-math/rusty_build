@@ -1,29 +1,18 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, process::Command};
 
 use anyhow::{Context, Result, ensure};
 use rusty_make::{
-    commands::generate_headers_py::GenerateHeadersPy,
-    headers::add_generated_header_dependencies,
-    parse_plan,
-    registry::Registry,
-    scheduler::{RunOptions, run},
+    graph::create_graph, headers::add_header_dependencies, parse, registry::Registry,
+    scheduler::execute,
 };
 
-const COMMAND_LOG: &str = include_str!("../fixtures/python_headers/commands.log");
 const EXPECTED_OUTPUT: &str = "generated answer: 42\n";
-
-// The registered Job owns this known script's parser, effects and batch execution.
-// Configured opaque Python identities intentionally do not declare these effects.
 
 fn require_tool(program: &str, description: &str) -> Result<()> {
     let output = Command::new(program)
         .arg("--version")
         .output()
-        .with_context(|| {
-            format!(
-                "prerequisite missing: {description}; install `{program}` and make it available on PATH"
-            )
-        })?;
+        .with_context(|| format!("prerequisite missing: {description}; install `{program}` and make it available on PATH"))?;
     ensure!(
         output.status.success(),
         "prerequisite unavailable: `{program} --version` failed ({}): {}",
@@ -36,9 +25,7 @@ fn require_tool(program: &str, description: &str) -> Result<()> {
 fn main() -> Result<()> {
     require_tool("python3", "Python 3 is needed to generate the header")?;
     require_tool("cc", "a C compiler is needed to build the application")?;
-    require_tool("bash", "Bash is needed to execute the original command log")?;
 
-    // Neither generated files nor scheduler metadata ever touch the repository.
     let workspace = tempfile::tempdir().context("creating isolated example workspace")?;
     let root = workspace.path();
     for directory in ["tools", "templates", "src", "generated", "build"] {
@@ -62,46 +49,30 @@ fn main() -> Result<()> {
         fs::write(root.join(path), contents).with_context(|| format!("copying fixture {path}"))?;
     }
 
-    let mut registry = Registry::default();
-    registry.register::<GenerateHeadersPy>()?;
-    // The compiler is deliberately BEFORE its generator in the fixture log.
-    // Only this source opts into dependencies on generated headers in its -I dirs.
-    let mut graph = parse_plan(COMMAND_LOG, root, &registry)?;
-    let stats = add_generated_header_dependencies(&mut graph, |_, source| {
-        source == Path::new("src/special.c")
-    })?;
-    ensure!(
-        stats.selected_jobs == 1 && stats.added_inputs == 1 && stats.added_dependencies == 1,
-        "expected one selected compiler, one header input and one prerequisite; got {stats:?}"
+    // Caller-supplied absolute fixture paths need no global chdir or path rewrite.
+    // The compiler deliberately precedes the trusted script in the command log.
+    let text = format!(
+        "cc -I '{}/generated' '{}/src/special.c' -o '{}/build/generated-app'\npython3 '{}/tools/generate_header.py' '{}/templates/generated.h.in' --output '{}/generated/generated.h'\n",
+        root.display(),
+        root.display(),
+        root.display(),
+        root.display(),
+        root.display(),
+        root.display(),
     );
+    // Default Python dispatch composes only the known GenerateHeadersPy handler;
+    // unrelated scripts are not silently treated as generic Python commands.
+    let mut jobs = parse(&text, &Registry::default())?;
+    add_header_dependencies(&mut jobs, Vec::<String>::new())?;
+    let graph = create_graph(jobs)?;
     ensure!(
-        graph.topological_waves()? == vec![vec![1], vec![0]],
+        graph.waves == vec![vec![1], vec![0]],
         "the generated-header prerequisite must hoist Python before the compiler"
     );
-    println!(
-        "Generated-header dependencies: selected jobs={}, added inputs={}, added dependencies={}",
-        stats.selected_jobs, stats.added_inputs, stats.added_dependencies
-    );
-
-    let report = run(
-        &graph,
-        &RunOptions {
-            jobs: 2,
-            ..Default::default()
-        },
-    )
-    .context("generating the header and compiling the C application")?;
-    ensure!(
-        report.executed == 2,
-        "expected both fixture commands to execute"
-    );
-    println!(
-        "Scheduler: executed={}, skipped={}, batches={}",
-        report.executed, report.skipped, report.batches
-    );
+    graph.check_inputs()?;
+    execute(&graph, true).context("generating the header and compiling the C application")?;
 
     let output = Command::new(root.join("build/generated-app"))
-        .current_dir(root)
         .output()
         .context("running the compiled C application")?;
     ensure!(

@@ -3,19 +3,15 @@ name = "rusty_make"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Conservative GNU Make command-log execution accelerator"
+description = "Parse command logs into native jobs and dependency-safe batches"
 
 [dependencies]
 anyhow = "1"
-blake3 = "1"
+brush-parser = "0.4"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
-regex = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+same-file = "1"
 shell-words = "1"
-tree-sitter = "0.25"
-tree-sitter-bash = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,78 +1,75 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 
-use crate::job::{
-    BatchContext, BatchItem, BatchReport, ExecutionContext, ExecutionStrategy, Job, JobRecord,
-};
-use crate::registry::command_pattern;
-use crate::shell::ShellCommand;
+use crate::job::{FileAccess, Job, JobData};
+use crate::shell::ShellHints;
 
+use super::external::execute_native;
 use super::fs::reject_symlink_components;
 
-#[derive(Clone, Debug, Parser, Serialize, Deserialize)]
+#[derive(Debug, Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 pub struct Mkdir {
     #[arg(short = 'p', long)]
     pub parents: bool,
     #[arg(required = true, num_args = 1..)]
-    pub paths: Vec<PathBuf>,
+    pub paths: Vec<String>,
+    #[arg(skip)]
+    pub data: JobData,
+}
+
+impl Mkdir {
+    pub fn parse(argv: &[String], shell: &ShellHints) -> Result<Self> {
+        let mut job = Self::try_parse_from(argv)?;
+        let mut accesses = Vec::new();
+        for path in &job.paths {
+            accesses.push(FileAccess::write(path.clone()));
+            if job.parents {
+                // These prefixes describe parent effects for comparison only;
+                // execution still receives the exact original operand.
+                for (index, character) in path.char_indices() {
+                    if (character == '/' || (cfg!(windows) && character == '\\')) && index > 0 {
+                        let parent = &path[..index];
+                        if !parent.ends_with(':')
+                            && !parent.ends_with('/')
+                            && !(cfg!(windows) && parent.ends_with('\\'))
+                            && !accesses.iter().any(|access| access.path == parent)
+                        {
+                            accesses.push(FileAccess::write(parent));
+                        }
+                    }
+                }
+            }
+        }
+        job.data = JobData::new(accesses);
+        job.data.shell = shell.clone();
+        Ok(job)
+    }
 }
 
 impl Job for Mkdir {
-    const TYPE: &'static str = "mkdir";
-
-    fn patterns() -> Vec<String> {
-        vec![command_pattern("mkdir")]
+    fn data(&self) -> &JobData {
+        &self.data
     }
 
-    fn parse(shell: &ShellCommand) -> Result<Self> {
-        Ok(Self::try_parse_from(
-            std::iter::once(shell.program.as_str()).chain(shell.args.iter().map(String::as_str)),
-        )?)
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
     }
 
-    fn inputs(&self) -> impl Iterator<Item = &Path> {
-        std::iter::empty()
-    }
-
-    fn outputs(&self) -> impl Iterator<Item = &Path> {
-        self.paths.iter().map(PathBuf::as_path)
-    }
-
-    fn strategy(&self) -> ExecutionStrategy {
-        ExecutionStrategy::Internal
-    }
-
-    fn cacheable(&self) -> bool {
-        true
-    }
-
-    fn creates_parents(&self) -> bool {
-        self.parents
-    }
-
-    fn validate(&self, _record: &JobRecord, cwd: &Path) -> Result<()> {
-        reject_symlink_components(self.outputs(), cwd)
-    }
-
-    fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        for path in &self.paths {
-            let path = ctx.absolute(path);
-            if self.parents {
-                fs::create_dir_all(&path)
-                    .with_context(|| format!("mkdir -p {}", path.display()))?;
-            } else {
-                fs::create_dir(&path).with_context(|| format!("mkdir {}", path.display()))?;
+    fn execute(&self) -> Result<()> {
+        execute_native(&self.data.shell, || {
+            reject_symlink_components(self.paths.iter().map(Path::new))?;
+            for path in &self.paths {
+                if self.parents {
+                    fs::create_dir_all(path).with_context(|| format!("mkdir -p {path}"))?;
+                } else {
+                    fs::create_dir(path).with_context(|| format!("mkdir {path}"))?;
+                }
             }
-        }
-        Ok(())
-    }
-
-    fn execute_batch(items: &[BatchItem<'_, Self>], ctx: &BatchContext<'_>) -> BatchReport {
-        ctx.run_each(items, |job, execution| job.execute(execution))
+            Ok(())
+        })
     }
 }

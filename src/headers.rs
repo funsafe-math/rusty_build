@@ -1,162 +1,205 @@
-//! Opt-in dependencies on declared generated headers, not general header discovery.
-
 use crate::{
-    graph::{BuildGraph, RequiredDependency, normalize},
-    job::JobRecord,
+    commands::compiler::Compiler,
+    graph::components,
+    job::{FileAccess, Job, Producer},
 };
-use anyhow::{Context, Result};
-use serde::Serialize;
+use anyhow::{Context, Result, bail};
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    fs,
+    io::ErrorKind,
 };
 
-#[derive(Debug, Default, Serialize)]
-pub struct HeaderDependencyStats {
-    pub selected_jobs: usize,
-    pub added_inputs: usize,
-    pub added_dependencies: usize,
+#[derive(Debug, Default)]
+struct Node {
+    children: BTreeMap<String, Node>,
+    header: Option<String>,
 }
 
-fn header(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            [
-                "h", "hh", "hpp", "hxx", "h++", "inc", "inl", "ipp", "tpp", "tcc", "cuh",
-            ]
-            .iter()
-            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
-        })
+#[derive(Debug, Default)]
+pub struct HeaderTrie {
+    root: Node,
 }
 
-/// Add all declared generated headers beneath a selected compiler's include dirs.
-///
-/// The predicate sees original source spellings from compiler metadata. All writers
-/// of each matching header become prerequisites, including later known writers.
-/// Neither command text nor argv is changed; undeclared effects are never guessed.
-/// A failed graph rebuild restores the original inputs and required dependencies.
-pub fn add_generated_header_dependencies<P>(
-    graph: &mut BuildGraph,
-    predicate: P,
-) -> Result<HeaderDependencyStats>
-where
-    P: Fn(&JobRecord, &Path) -> bool,
-{
-    let mut writers = BTreeMap::<PathBuf, BTreeSet<usize>>::new();
-    for (node, job) in graph.jobs.iter().enumerate() {
-        for output in &job.spec.outputs {
-            if header(output) {
-                writers
-                    .entry(normalize(&graph.cwd, output))
-                    .or_default()
-                    .insert(node);
+impl HeaderTrie {
+    pub fn insert(&mut self, path: impl Into<String>) {
+        let path = path.into();
+        let mut node = &mut self.root;
+        for component in components(&path) {
+            node = node.children.entry(component.to_owned()).or_default();
+        }
+        node.header = Some(path);
+    }
+
+    pub fn headers_under(&self, directory: &str) -> Vec<&str> {
+        let mut node = &self.root;
+        for component in components(directory) {
+            let Some(child) = node.children.get(component) else {
+                return Vec::new();
+            };
+            node = child;
+        }
+        let mut result = Vec::new();
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if let Some(header) = &node.header {
+                result.push(header.as_str());
+            }
+            pending.extend(node.children.values().rev());
+        }
+        result
+    }
+}
+
+fn is_header(path: &str) -> bool {
+    let Some((_, extension)) = path.rsplit('/').next().unwrap_or(path).rsplit_once('.') else {
+        return false;
+    };
+    [
+        "h", "hh", "hp", "hpp", "hxx", "h++", "inc", "inl", "ipp", "tpp", "tcc", "cuh",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+/// Inventory existing include-directory headers without resolving or rewriting
+/// their spellings. Symlinked child directories are never followed.
+pub fn discover_headers(jobs: &[Box<dyn Job>]) -> Result<Vec<String>> {
+    let roots: BTreeSet<_> = jobs
+        .iter()
+        .filter_map(|job| (job.as_ref() as &dyn Any).downcast_ref::<Compiler>())
+        .flat_map(|compiler| compiler.include_dirs.iter().cloned())
+        .collect();
+    let mut pending: Vec<_> = roots.into_iter().collect();
+    let mut visited = BTreeSet::new();
+    let mut headers = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading header directory {directory:?}"));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let filename = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 header entry in {directory:?}"))?;
+            let path = if directory.ends_with('/') {
+                format!("{directory}{filename}")
+            } else {
+                format!("{directory}/{filename}")
+            };
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if (kind.is_file() || kind.is_symlink()) && is_header(&path) {
+                headers.insert(path);
             }
         }
     }
+    Ok(headers.into_iter().collect())
+}
 
-    let original_input_lengths: Vec<_> = graph.jobs.iter().map(|j| j.spec.inputs.len()).collect();
-    let original_dependency_count = graph.required_dependencies.len();
-    // Existing records can name an original job now fused into another node.
-    let source_nodes: BTreeMap<_, _> = graph
-        .provenance
-        .iter()
-        .enumerate()
-        .flat_map(|(node, originals)| originals.iter().map(move |job| (job.source.line, node)))
-        .collect();
-    let mut required: BTreeSet<_> = graph
-        .required_dependencies
-        .iter()
-        .filter_map(|dependency| {
-            Some((
-                *source_nodes.get(&dependency.producer_line)?,
-                *source_nodes.get(&dependency.consumer_line)?,
-                normalize(&graph.cwd, &dependency.artifact),
-            ))
-        })
-        .collect();
-    let mut stats = HeaderDependencyStats::default();
-    let source_lines: Vec<_> = graph.jobs.iter().map(|job| job.source.line).collect();
-    for (consumer, job) in graph.jobs.iter_mut().enumerate() {
-        if !matches!(job.spec.kind.as_str(), "compile" | "link")
-            || !job.spec.parsed["sources"]
-                .as_array()
-                .is_some_and(|sources| {
-                    sources
-                        .iter()
-                        .filter_map(|source| source.as_str())
-                        .any(|source| predicate(job, Path::new(source)))
-                })
-        {
-            continue;
+/// Conservatively read every known header beneath each compiler include dir.
+/// Existing preceding writers select the current value; only a unique future
+/// writer can supply a header with no preceding writer.
+pub fn add_header_dependencies(
+    jobs: &mut [Box<dyn Job>],
+    existing_headers: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    let mut trie = HeaderTrie::default();
+    for header in existing_headers {
+        if is_header(&header) {
+            trie.insert(header);
         }
-        stats.selected_jobs += 1;
-        let directories: BTreeSet<_> = job.spec.parsed["includes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|directory| directory.as_str())
-            .map(|directory| normalize(&graph.cwd, Path::new(directory)))
-            .collect();
-        let mut inputs: BTreeSet<_> = job
-            .spec
-            .inputs
+    }
+    let mut writers: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, job) in jobs.iter().enumerate() {
+        for access in &job.data().accesses {
+            if access.access.writes() && is_header(&access.path) {
+                trie.insert(access.path.clone());
+                let entries = writers.entry(&access.path).or_default();
+                if entries.last() != Some(&index) {
+                    entries.push(index);
+                }
+            }
+        }
+    }
+    let mut additions = Vec::new();
+    for (consumer, job) in jobs.iter().enumerate() {
+        let Some(compiler) = (job.as_ref() as &dyn Any).downcast_ref::<Compiler>() else {
+            continue;
+        };
+        let headers: BTreeSet<_> = compiler
+            .include_dirs
             .iter()
-            .map(|input| normalize(&graph.cwd, input))
+            .flat_map(|directory| trie.headers_under(directory))
             .collect();
-        let outputs: BTreeSet<_> = job
-            .spec
-            .outputs
-            .iter()
-            .map(|output| normalize(&graph.cwd, output))
-            .collect();
-        for (artifact, producers) in &writers {
-            if outputs.contains(artifact)
-                || !directories
-                    .iter()
-                    .any(|directory| artifact.starts_with(directory))
+        let mut accesses = Vec::new();
+        let mut producers = Vec::new();
+        for header in headers {
+            if job
+                .data()
+                .accesses
+                .iter()
+                .any(|access| access.access.writes() && access.path == header)
             {
                 continue;
             }
-            if inputs.insert(artifact.clone()) {
-                job.spec.inputs.push(artifact.clone());
-                stats.added_inputs += 1;
+            if !job
+                .data()
+                .accesses
+                .iter()
+                .any(|access| access.access.reads() && access.path == header)
+            {
+                accesses.push(FileAccess::read(header));
             }
-            for &producer in producers {
-                if producer == consumer {
-                    continue;
+            if job
+                .data()
+                .producers
+                .iter()
+                .any(|producer| producer.input == header)
+            {
+                continue;
+            }
+            let Some(candidates) = writers.get(header) else {
+                continue;
+            };
+            let preceding = candidates.partition_point(|&writer| writer < consumer);
+            let producer = if preceding != 0 {
+                Some(candidates[preceding - 1])
+            } else {
+                let mut future = candidates
+                    .iter()
+                    .copied()
+                    .filter(|&writer| writer > consumer);
+                let first = future.next();
+                if future.next().is_some() {
+                    bail!("ambiguous future producers for header {header:?} at job {consumer}");
                 }
-                if required.insert((producer, consumer, artifact.clone())) {
-                    graph.required_dependencies.push(RequiredDependency {
-                        producer_line: source_lines[producer],
-                        consumer_line: job.source.line,
-                        artifact: artifact.clone(),
-                        reason: "generated header beneath selected compiler include directory"
-                            .into(),
-                    });
-                    stats.added_dependencies += 1;
-                }
+                first
+            };
+            if let Some(job) = producer {
+                producers.push(Producer {
+                    input: header.to_owned(),
+                    job,
+                });
             }
         }
+        additions.push((consumer, accesses, producers));
     }
-
-    if stats.added_inputs != 0 || stats.added_dependencies != 0 {
-        if let Err(error) = graph.rebuild() {
-            for (job, length) in graph.jobs.iter_mut().zip(original_input_lengths) {
-                job.spec.inputs.truncate(length);
-            }
-            graph
-                .required_dependencies
-                .truncate(original_dependency_count);
-            graph
-                .rebuild()
-                .context("restore graph after generated-header dependency failure")?;
-            return Err(error).context("add generated-header dependencies");
-        }
-        graph.decisions.push(format!(
-            "generated headers: {} selected compiler jobs, {} added inputs, {} added required dependencies",
-            stats.selected_jobs, stats.added_inputs, stats.added_dependencies,
-        ));
+    // Validation above is transactional: ambiguity does not partially edit jobs.
+    for (consumer, accesses, producers) in additions {
+        jobs[consumer].data_mut().accesses.extend(accesses);
+        jobs[consumer].data_mut().producers.extend(producers);
     }
-    Ok(stats)
+    Ok(())
 }

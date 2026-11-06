@@ -1,117 +1,78 @@
-use std::fs::{self, File, FileTimes, OpenOptions};
+use std::fs::{self, FileTimes, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 
-use crate::job::{
-    BatchContext, BatchItem, BatchReport, ExecutionContext, ExecutionStrategy, Job, JobRecord,
-};
-use crate::registry::command_pattern;
-use crate::shell::ShellCommand;
+use crate::job::{FileAccess, Job, JobData};
+use crate::shell::ShellHints;
 
-use super::fs::{checked_regular, reject_symlink_components, singleton};
+use super::external::execute_native;
+use super::fs::{checked_regular, reject_symlink_components};
 
-#[derive(Clone, Debug, Parser, Serialize, Deserialize)]
+#[derive(Debug, Parser)]
 #[command(disable_help_flag = true, disable_version_flag = true)]
 pub struct Touch {
     #[arg(required = true, num_args = 1..)]
-    pub paths: Vec<PathBuf>,
+    pub paths: Vec<String>,
+    #[arg(skip)]
+    pub data: JobData,
+}
+
+impl Touch {
+    pub fn parse(argv: &[String], shell: &ShellHints) -> Result<Self> {
+        let mut job = Self::try_parse_from(argv)?;
+        // Touch can create a missing file; it has no required content input.
+        job.data = JobData::new(job.paths.iter().map(FileAccess::write).collect());
+        job.data.shell = shell.clone();
+        Ok(job)
+    }
 }
 
 impl Job for Touch {
-    const TYPE: &'static str = "touch";
-
-    fn patterns() -> Vec<String> {
-        vec![command_pattern("touch")]
+    fn data(&self) -> &JobData {
+        &self.data
     }
 
-    fn parse(shell: &ShellCommand) -> Result<Self> {
-        Ok(Self::try_parse_from(
-            std::iter::once(shell.program.as_str()).chain(shell.args.iter().map(String::as_str)),
-        )?)
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
     }
 
-    fn inputs(&self) -> impl Iterator<Item = &Path> {
-        self.paths.iter().map(PathBuf::as_path)
-    }
-
-    fn outputs(&self) -> impl Iterator<Item = &Path> {
-        self.paths.iter().map(PathBuf::as_path)
-    }
-
-    fn strategy(&self) -> ExecutionStrategy {
-        ExecutionStrategy::Internal
-    }
-
-    // Timestamp updates are observable even when file contents do not change.
-    fn cacheable(&self) -> bool {
-        false
-    }
-
-    fn validate(&self, _record: &JobRecord, cwd: &Path) -> Result<()> {
-        reject_symlink_components(self.outputs(), cwd)
-    }
-
-    fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        for path in &self.paths {
-            touch(&ctx.absolute(path))?;
-        }
-        Ok(())
-    }
-
-    fn execute_batch(items: &[BatchItem<'_, Self>], ctx: &BatchContext<'_>) -> BatchReport {
-        ctx.run_each(items, |job, execution| job.execute(execution))
+    fn execute(&self) -> Result<()> {
+        execute_native(&self.data.shell, || {
+            reject_symlink_components(self.paths.iter().map(Path::new))?;
+            for path in &self.paths {
+                touch(Path::new(path))?;
+            }
+            Ok(())
+        })
     }
 }
 
 fn touch(path: &Path) -> Result<()> {
     let file = match fs::symlink_metadata(path) {
         Ok(_) => {
-            if !singleton(&checked_regular(path)?) {
-                bail!(
-                    "native touch does not support multiply-linked files: {}",
-                    path.display()
-                );
-            }
-            File::open(path).with_context(|| format!("opening {} for touch", path.display()))?
+            checked_regular(path)?;
+            // Windows needs write access for SetFileTime; Unix can also touch
+            // an owned read-only file through a read-only descriptor.
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            options.write(true);
+            options
+                .open(path)
+                .with_context(|| format!("opening {} for touch", path.display()))?
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            OpenOptions::new().write(true).create_new(true).open(path)?
-        }
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("creating {} for touch", path.display()))?,
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
     };
     let now = std::time::SystemTime::now();
-    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
+    file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+        .with_context(|| format!("touch {}", path.display()))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_touch_creates_file_and_preserves_contents() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a");
-        touch(&path).unwrap();
-        assert!(path.is_file());
-        fs::write(&path, "payload").unwrap();
-        touch(&path).unwrap();
-        assert_eq!(fs::read(path).unwrap(), b"payload");
-        assert!(!Touch { paths: vec![] }.cacheable());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn touch_rejects_hard_links() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a");
-        fs::write(&path, "payload").unwrap();
-        fs::hard_link(&path, dir.path().join("b")).unwrap();
-        assert!(touch(&path).is_err());
-        assert_eq!(fs::read(path).unwrap(), b"payload");
-    }
 }

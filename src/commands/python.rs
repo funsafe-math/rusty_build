@@ -1,150 +1,107 @@
-use std::path::Path;
+use anyhow::Result;
 
-use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use crate::job::Job;
+use crate::shell::ShellHints;
 
-use crate::job::{ExecutionContext, Job};
-use crate::shell::ShellCommand;
+type Handler = Box<dyn Fn(&[String], &ShellHints) -> Result<Option<Box<dyn Job>>>>;
 
-use super::external::{apply_null_streams, execute_original};
-use crate::job::requires_original_shell;
-
-/// A configured script identity, deliberately independent of interpreter spelling.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Nested, explicitly registered script handlers, not a Python command grammar.
+#[derive(Default)]
 pub struct Python {
-    pub identity: String,
-    pub interpreter: String,
-    pub script: String,
-    pub args: Vec<String>,
+    handlers: Vec<Handler>,
 }
 
 impl Python {
-    pub fn identified(identity: &str, script: &str, shell: &ShellCommand) -> Result<Self> {
-        ensure!(
-            !identity.is_empty() && !script.is_empty(),
-            "Python configuration requires an identity and script"
-        );
-        ensure!(
-            is_python(&shell.program) && shell.args.first().is_some_and(|arg| arg == script),
-            "expected Python interpreter and exact script {script}"
-        );
-        Ok(Self {
-            identity: identity.into(),
-            interpreter: shell.program.clone(),
-            script: script.into(),
-            args: shell.args[1..].to_vec(),
-        })
-    }
-}
-
-impl Job for Python {
-    const TYPE: &'static str = "python";
-
-    fn parse(shell: &ShellCommand) -> Result<Self> {
-        let script = shell
-            .args
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("Python requires a script"))?;
-        Self::identified(Self::TYPE, script, shell)
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn kind(&self) -> &str {
-        &self.identity
+    pub fn register(
+        &mut self,
+        handler: impl Fn(&[String], &ShellHints) -> Result<Option<Box<dyn Job>>> + 'static,
+    ) {
+        self.handlers.push(Box::new(handler));
     }
 
-    fn inputs(&self) -> impl Iterator<Item = &Path> {
-        std::iter::empty()
-    }
-
-    fn outputs(&self) -> impl Iterator<Item = &Path> {
-        std::iter::empty()
-    }
-
-    fn unknown_effects(&self) -> bool {
-        true
-    }
-
-    fn execute(&self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if ctx.record.shell.is_none() || requires_original_shell(ctx.record.shell.as_ref()) {
-            return execute_original(ctx);
+    /// The first claiming handler wins; errors from a claiming parser propagate.
+    /// Every handler receives the complete original argv and shell hints.
+    pub fn parse(&self, argv: &[String], hints: &ShellHints) -> Result<Option<Box<dyn Job>>> {
+        for handler in &self.handlers {
+            if let Some(job) = handler(argv, hints)? {
+                return Ok(Some(job));
+            }
         }
-        let mut command = std::process::Command::new(&self.interpreter);
-        command
-            .arg(&self.script)
-            .args(&self.args)
-            .current_dir(ctx.cwd);
-        apply_null_streams(&mut command, ctx.record.shell.as_ref());
-        let status = command
-            .status()
-            .with_context(|| format!("starting Python interpreter {}", self.interpreter))?;
-        if !status.success() {
-            bail!(
-                "Python command on line {} failed ({status}): {}",
-                ctx.record.source.line,
-                ctx.record.source.text
-            );
-        }
-        Ok(())
+        Ok(None)
     }
-
-    // Default batching preserves an independent process for every opaque script.
-}
-
-pub fn is_python(program: &str) -> bool {
-    let name = if cfg!(windows) {
-        program.rsplit(['/', '\\']).next().unwrap_or(program)
-    } else {
-        program.rsplit('/').next().unwrap_or(program)
-    };
-    let name = name.strip_suffix(".exe").unwrap_or(name);
-    if name == "py" || name == "python" {
-        return true;
-    }
-    name.strip_prefix("python").is_some_and(|version| {
-        !version.is_empty()
-            && version
-                .split('.')
-                .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::JobData;
+    use std::{cell::RefCell, rc::Rc};
 
-    #[test]
-    fn identity_is_separate_from_interpreter_and_effects_stay_opaque() {
-        for text in [
-            "python 'scripts/make data.py' --out result",
-            "/usr/bin/python3.12 'scripts/make data.py'",
-            "py 'scripts/make data.py'",
-        ] {
-            let shell = crate::shell::parse(text).unwrap().unwrap();
-            let job = Python::identified("generate", "scripts/make data.py", &shell).unwrap();
-            assert_eq!(job.kind(), "generate");
-            assert_eq!(job.interpreter, shell.program);
-            assert!(job.unknown_effects() && !job.cacheable());
-            assert_eq!(job.inputs().count(), 0);
-            assert_eq!(job.outputs().count(), 0);
+    #[derive(Debug, Default)]
+    struct ScriptJob {
+        data: JobData,
+    }
+
+    impl Job for ScriptJob {
+        fn data(&self) -> &JobData {
+            &self.data
+        }
+        fn data_mut(&mut self) -> &mut JobData {
+            &mut self.data
+        }
+        fn execute(&self) -> Result<()> {
+            Ok(())
         }
     }
 
     #[test]
-    fn exact_script_and_interpreter_are_required() {
-        for text in [
-            "python different.py",
-            "python -O build.py",
-            "pythonfuture build.py",
-            "not-python build.py",
-        ] {
-            let shell = crate::shell::parse(text).unwrap().unwrap();
-            assert!(Python::identified("generate", "build.py", &shell).is_err());
-        }
-        for name in ["python", "py", "/usr/bin/python3", "python3.12"] {
-            assert!(is_python(name));
-        }
-        for name in ["python.", "python3.", "python3..1", "pythonfuture"] {
-            assert!(!is_python(name));
-        }
+    fn nested_dispatch_passes_full_argv_and_hints_without_interpreting_python() {
+        let argv = [
+            "custom-python",
+            "-I",
+            "-m",
+            "package.generator",
+            "--output",
+            "file.h",
+        ]
+        .map(str::to_owned);
+        let mut hints = ShellHints::default();
+        hints.stdout = Some("log".into());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut inner = Python::new();
+        let seen = Rc::clone(&calls);
+        inner.register(move |argv, hints| {
+            seen.borrow_mut().push((argv.to_vec(), hints.clone()));
+            Ok(Some(Box::new(ScriptJob::default())))
+        });
+        let mut outer = Python::new();
+        let declined = Rc::clone(&calls);
+        outer.register(move |argv, hints| {
+            declined.borrow_mut().push((argv.to_vec(), hints.clone()));
+            Ok(None)
+        });
+        outer.register(move |argv, hints| inner.parse(argv, hints));
+        outer.register(|_, _| panic!("must stop after a handler claims the invocation"));
+        assert!(outer.parse(&argv, &hints).unwrap().is_some());
+        assert_eq!(
+            *calls.borrow(),
+            vec![(argv.to_vec(), hints.clone()), (argv.to_vec(), hints)]
+        );
+    }
+
+    #[test]
+    fn unrelated_scripts_are_declined_and_errors_are_not_swallowed() {
+        let argv = ["python3", "unrelated.py"].map(str::to_owned);
+        let hints = ShellHints::default();
+        assert!(Python::new().parse(&argv, &hints).unwrap().is_none());
+        let mut python = Python::new();
+        python.register(super::super::generate_headers_py::GenerateHeadersPy::parse);
+        assert!(python.parse(&argv, &hints).unwrap().is_none());
+        let malformed = ["python3", "tools/generate_header.py", "input"].map(str::to_owned);
+        assert!(python.parse(&malformed, &hints).is_err());
     }
 }

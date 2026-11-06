@@ -1,715 +1,623 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusty_make::commands::coan::Coan;
-use rusty_make::input::SourceCommand;
-use rusty_make::job::{
-    BatchContext, BatchItem, ExecutionContext, ExecutionStrategy, Job, JobRecord,
-};
-use rusty_make::registry::Registry;
-use rusty_make::shell;
+use rusty_make::job::{Access, FileAccess, Job, is_null_device};
+use rusty_make::shell::ShellHints;
 
 const CONDITIONAL: &str = "#ifdef FEATURE\nkept\n#else\ndropped\n#endif\n";
+const BROKEN: &str = "#ifdef FEATURE\nunterminated\n";
 
-// Optional real-tool tests use coan from PATH, or the executable explicitly
-// selected by RUSTY_MAKE_COAN. An invalid explicit selection is a test failure.
+// An explicit selection must work. No test substitutes a mock for real coan.
 fn reference() -> Option<String> {
     let explicit = std::env::var("RUSTY_MAKE_COAN").ok();
     let program = explicit.clone().unwrap_or_else(|| "coan".into());
     match Command::new(&program).arg("--version").output() {
         Ok(output) if output.status.success() => Some(program),
-        result if explicit.is_some() => {
-            panic!("RUSTY_MAKE_COAN must select a real coan executable: {result:?}")
-        }
+        result if explicit.is_some() => panic!("RUSTY_MAKE_COAN must select real coan: {result:?}"),
         _ => {
-            eprintln!("skipping real coan test: install coan on PATH or set RUSTY_MAKE_COAN");
+            eprintln!("skipping real coan test: install coan or set RUSTY_MAKE_COAN");
             None
         }
     }
 }
 
-fn source(text: &str) -> SourceCommand {
-    SourceCommand {
-        line: 1,
-        text: text.into(),
-        target: None,
+fn path(root: &Path, name: &str) -> String {
+    root.join(name).to_str().unwrap().to_owned()
+}
+
+fn parse(program: &str, options: &[&str], inputs: &[&str], shell: ShellHints) -> Coan {
+    let argv = std::iter::once(program)
+        .chain(std::iter::once("source"))
+        .chain(options.iter().copied())
+        .chain(inputs.iter().copied())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut job = Coan::parse(&argv, &shell).unwrap();
+    // Registry normally attaches these, including redirection accesses.
+    for redirect in [&shell.stdout, &shell.stderr].into_iter().flatten() {
+        if !is_null_device(redirect) {
+            job.data.accesses.push(FileAccess::write(redirect));
+        }
     }
+    job.data.shell = shell;
+    job
 }
 
-fn record(root: &Path, program: &str, args: &[&str], redirect: &str) -> JobRecord {
-    let text = std::iter::once(program)
-        .chain(args.iter().copied())
-        .map(|arg| shell_words::quote(arg).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
-        + redirect;
-    let shell = shell::parse(&text).unwrap().unwrap();
-    let job = Coan::parse(&shell).unwrap();
-    let mut record = JobRecord::new(source(&text), Some(shell), job).unwrap();
-    record.refine_effects(root).unwrap();
-    record
-}
-
-fn execute(record: &JobRecord, root: &Path) -> anyhow::Result<()> {
-    record
-        .typed::<Coan>()
-        .unwrap()
-        .execute(&ExecutionContext { cwd: root, record })
-}
-
-fn batch(
-    records: &[JobRecord],
-    root: &Path,
-    cancelled: &AtomicBool,
-) -> rusty_make::job::BatchReport {
-    let items: Vec<_> = records
-        .iter()
-        .enumerate()
-        .map(|(id, record)| BatchItem {
-            id,
-            job: record.typed::<Coan>().unwrap(),
-            record,
-        })
-        .collect();
-    Coan::execute_batch(
-        &items,
-        &BatchContext {
-            cwd: root,
-            cancelled,
-        },
+fn stdout(program: &str, options: &[&str], input: &str, output: &str) -> Coan {
+    parse(
+        program,
+        options,
+        &[input],
+        ShellHints::new(Some(output.into()), None, false),
     )
 }
 
+fn batch(jobs: &[Coan]) -> anyhow::Result<()> {
+    let items: Vec<&dyn Job> = jobs.iter().map(|job| job as &dyn Job).collect();
+    jobs[0].execute_batch(&items)
+}
+
 #[test]
-fn anchored_matchers_and_conservative_argv_preserve_original_commands() {
-    let registry = Registry::default();
-    for program in [
+fn flat_metadata_retains_original_argv_and_generated_file_paths() {
+    let hints = ShellHints::new(Some("generated/output.c".into()), None, false);
+    let argv = ["tools/coan", "source", "-DFEATURE=1", "generated/input.c"].map(str::to_owned);
+    let job = Coan::parse(&argv, &hints).unwrap();
+    assert_eq!(job.argv, argv);
+    assert_eq!(job.args, ["tools/coan", "source", "-DFEATURE=1"]);
+    assert_eq!(job.inputs, ["generated/input.c"]);
+    assert_eq!(job.outputs, ["generated/output.c"]);
+    assert_eq!(job.data.accesses, [FileAccess::read("generated/input.c")]);
+    assert!(!job.data.unknown_effects);
+    let job = parse(
         "coan",
-        "coan.exe",
-        "/opt/bin/coan",
-        "'tools with spaces/coan.exe'",
+        &["--replace", "-DFEATURE=1"],
+        &["generated.c"],
+        ShellHints::default(),
+    );
+    assert_eq!(job.data.accesses, [FileAccess::read_write("generated.c")]);
+    assert_eq!(job.data.accesses[0].access, Access::ReadWrite);
+    assert!(!job.data.unknown_effects);
+}
+
+#[test]
+fn unknown_effects_keep_exact_argv_and_known_missing_values_are_errors() {
+    for options in [
+        vec!["--future-option", "value"],
+        vec!["--backup=.bak"],
+        vec!["--recurse"],
+        vec!["--file", "settings"],
     ] {
-        let text = format!("{program} source --future-option 'x y.c'");
-        let record = registry.classify(source(&text)).unwrap();
-        assert_eq!(record.spec.kind, "coan", "{text}");
-        assert_eq!(record.strategy, ExecutionStrategy::External);
-        assert!(record.spec.unknown_effects);
-        assert!(!record.spec.cacheable);
-        assert_eq!(record.source.text, text);
-        assert_eq!(
-            record.typed::<Coan>().unwrap().argv[1..],
-            ["source", "--future-option", "x y.c"]
+        let job = parse(
+            "coan",
+            &options,
+            &["input.c"],
+            ShellHints::new(Some("out.c".into()), None, false),
         );
+        assert!(job.data.unknown_effects, "{options:?}");
+        assert_eq!(job.argv[2..2 + options.len()], options);
     }
-    for program in ["coan-wrapper", "notcoan", "coan.exe.extra"] {
-        assert_eq!(
-            registry
-                .classify(source(&format!("{program} source file.c")))
-                .unwrap()
-                .spec
-                .kind,
-            "unknown"
-        );
-    }
-    let windows_path = registry
-        .classify(source("'C:\\tools\\coan.exe' source file.c"))
-        .unwrap();
-    assert_eq!(
-        windows_path.spec.kind,
-        if cfg!(windows) { "coan" } else { "unknown" }
-    );
-}
-
-#[test]
-fn only_explicit_closed_replacement_files_have_precise_effects() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("file.c"), CONDITIONAL).unwrap();
-    let precise = record(
-        root.path(),
-        "coan",
-        &[
-            "source",
-            "-r",
-            "--define",
-            "FEATURE=1",
-            "--discard=drop",
-            "file.c",
-        ],
-        "",
-    );
-    #[cfg(unix)]
-    {
-        assert!(!precise.spec.unknown_effects);
-        assert_eq!(precise.spec.inputs, [PathBuf::from("file.c")]);
-        assert_eq!(precise.spec.outputs, [PathBuf::from("file.c")]);
-    }
-    assert!(!precise.spec.cacheable);
-    for args in [
-        vec!["source", "-DFEATURE=1", "file.c"],
-        vec!["source", "-r", "-DFEATURE=1"],
-        vec!["source", "-r", "--backup=.bak", "file.c"],
-        vec!["source", "-r", "--recurse", "file.c"],
-        vec!["source", "-r", "--file", "settings", "file.c"],
-        vec!["source", "-r", "--future-option", "file.c"],
-        vec!["symbols", "-DFEATURE=1", "file.c"],
-    ] {
-        let job = record(root.path(), "coan", &args, "");
-        assert!(job.spec.unknown_effects, "{args:?}");
-        assert!(!job.spec.cacheable);
-    }
-    let redirected = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "file.c"],
-        " > report",
-    );
-    assert!(redirected.spec.unknown_effects);
-    assert_eq!(redirected.spec.outputs, [PathBuf::from("report")]);
-}
-
-#[test]
-fn real_changed_exit_17_is_success_and_changes_the_requested_file() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("reference.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("typed.c"), CONDITIONAL).unwrap();
-    let status = Command::new(&coan)
-        .current_dir(root.path())
-        .args(["source", "-r", "-DFEATURE=1", "reference.c"])
-        .status()
-        .unwrap();
-    assert_eq!(status.code(), Some(17), "real coan changed-source status");
-    let job = record(
-        root.path(),
-        &coan,
-        &["source", "-r", "-DFEATURE=1", "typed.c"],
-        "",
-    );
-    execute(&job, root.path()).unwrap();
-    assert_eq!(
-        fs::read_to_string(root.path().join("typed.c")).unwrap(),
-        "kept\n"
-    );
-}
-
-#[test]
-fn real_plain_source_reporting_and_simple_redirects_execute_directly() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("input.c"), CONDITIONAL).unwrap();
-    fs::write(
-        root.path().join("output.txt"),
-        "old output must be truncated\n",
-    )
-    .unwrap();
-    for redirect in [" > output.txt", " >> output.txt"] {
-        execute(
-            &record(
-                root.path(),
-                &coan,
-                &["source", "-DFEATURE=1", "input.c"],
-                redirect,
-            ),
-            root.path(),
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        fs::read_to_string(root.path().join("output.txt")).unwrap(),
-        "kept\nkept\n"
-    );
-    execute(
-        &record(
-            root.path(),
-            &coan,
-            &["symbols", "input.c"],
-            " > symbols.txt",
-        ),
-        root.path(),
-    )
-    .unwrap();
-    assert!(
-        fs::read_to_string(root.path().join("symbols.txt"))
-            .unwrap()
-            .contains("FEATURE")
-    );
-    let bad = record(
-        root.path(),
-        &coan,
-        &["source", "--not-a-real-coan-option"],
-        " 2> errors.txt",
-    );
-    assert!(execute(&bad, root.path()).is_err());
-    assert!(!fs::read(root.path().join("errors.txt")).unwrap().is_empty());
-}
-
-#[test]
-fn real_stdin_filename_list_preserves_spaces_and_remains_conservative() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("one spaced.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("two spaced.c"), CONDITIONAL).unwrap();
-    fs::write(
-        root.path().join("list.txt"),
-        "\"one spaced.c\"\n\"two spaced.c\"\n",
-    )
-    .unwrap();
-    let job = record(
-        root.path(),
-        &coan,
-        &["source", "-r", "-DFEATURE=1"],
-        " < list.txt",
-    );
-    assert!(job.spec.unknown_effects);
-    execute(&job, root.path()).unwrap();
-    for name in ["one spaced.c", "two spaced.c"] {
-        assert_eq!(
-            fs::read_to_string(root.path().join(name)).unwrap(),
-            "kept\n"
-        );
-    }
-}
-
-#[test]
-fn real_batch_quotes_spaced_names_and_never_mixes_different_settings() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    for name in ["first spaced.c", "second.c", "third spaced.c"] {
-        fs::write(root.path().join(name), CONDITIONAL).unwrap();
-    }
-    let records = [
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-DFEATURE=1", "first spaced.c"],
-            "",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-UFEATURE", "second.c"],
-            "",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-DFEATURE=1", "third spaced.c"],
-            "",
-        ),
-    ];
-    let cancelled = AtomicBool::new(false);
-    let report = batch(&records, root.path(), &cancelled);
-    assert_eq!(report.outcomes.len(), 3);
-    assert!(report.outcomes.iter().all(|(_, result)| result.is_ok()));
-    assert!(!cancelled.load(Ordering::Acquire));
-    assert_eq!(
-        fs::read_to_string(root.path().join("first spaced.c")).unwrap(),
-        "kept\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("second.c")).unwrap(),
-        "dropped\n"
-    );
-    assert_eq!(
-        fs::read_to_string(root.path().join("third spaced.c")).unwrap(),
-        "kept\n"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn real_aggregate_batch_error_certifies_no_per_file_successes() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("good.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("bad.c"), "#ifdef FEATURE\nunterminated\n").unwrap();
-    let records = [
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "good.c"],
-            "",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "bad.c"],
-            "",
-        ),
-    ];
-    let cancelled = AtomicBool::new(false);
-    let report = batch(&records, root.path(), &cancelled);
-    // This distinguishes a single real external batch from run_each, which
-    // would incorrectly certify good.c before observing bad.c's error.
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(report.outcomes.iter().all(|(_, result)| result.is_err()));
-    assert!(cancelled.load(Ordering::Acquire));
-    assert_eq!(
-        fs::read_to_string(root.path().join("good.c")).unwrap(),
-        "kept\n"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn newly_introduced_aliases_and_directories_are_rejected_before_edits() {
-    use std::os::unix::fs::symlink;
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("safe.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("other.c"), CONDITIONAL).unwrap();
-    let safe = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "safe.c"],
-        "",
-    );
-    let other = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "other.c"],
-        "",
-    );
-    assert!(!safe.spec.unknown_effects);
-    fs::remove_file(root.path().join("other.c")).unwrap();
-    symlink("safe.c", root.path().join("other.c")).unwrap();
-    let report = batch(&[safe, other], root.path(), &AtomicBool::new(false));
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(report.outcomes.iter().all(|(_, result)| result.is_err()));
-    assert_eq!(
-        fs::read_to_string(root.path().join("safe.c")).unwrap(),
-        CONDITIONAL
-    );
-
-    fs::remove_file(root.path().join("other.c")).unwrap();
-    fs::write(root.path().join("other.c"), CONDITIONAL).unwrap();
-    let directory = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "other.c"],
-        "",
-    );
-    fs::remove_file(root.path().join("other.c")).unwrap();
-    fs::create_dir(root.path().join("other.c")).unwrap();
-    assert!(execute(&directory, root.path()).is_err());
-
-    let generated = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "generated.c"],
-        "",
-    );
-    assert!(!generated.spec.unknown_effects);
-    symlink("safe.c", root.path().join("generated.c")).unwrap();
-    assert!(execute(&generated, root.path()).is_err());
-    assert_eq!(
-        fs::read_to_string(root.path().join("safe.c")).unwrap(),
-        CONDITIONAL
-    );
-
-    let linked = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "safe.c"],
-        "",
-    );
-    fs::hard_link(root.path().join("safe.c"), root.path().join("alias.c")).unwrap();
-    assert!(execute(&linked, root.path()).is_err());
-    assert_eq!(
-        fs::read_to_string(root.path().join("safe.c")).unwrap(),
-        CONDITIONAL
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn real_quotes_and_newlines_in_names_execute_separately_not_as_stdin_lists() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    let names = ["quoted\"name.c", "line\nbreak.c"];
-    for name in names {
-        fs::write(root.path().join(name), CONDITIONAL).unwrap();
-    }
-    let records: Vec<_> = names
-        .iter()
-        .map(|name| {
-            record(
-                root.path(),
-                &coan,
-                &["source", "-r", "-DFEATURE=1", name],
-                "",
-            )
-        })
-        .collect();
-    let report = batch(&records, root.path(), &AtomicBool::new(false));
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(report.outcomes.iter().all(|(_, result)| result.is_ok()));
-    for name in names {
-        assert_eq!(
-            fs::read_to_string(root.path().join(name)).unwrap(),
-            "kept\n"
-        );
-    }
-}
-
-#[test]
-fn cancelled_batch_does_not_start_any_command() {
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("file.c"), CONDITIONAL).unwrap();
-    let job = record(
-        root.path(),
-        "nonexistent-coan-executable",
-        &["source", "-r", "-DFEATURE=1", "file.c"],
-        "",
-    );
-    let report = batch(&[job], root.path(), &AtomicBool::new(true));
-    assert!(report.outcomes.is_empty());
-    assert_eq!(
-        fs::read_to_string(root.path().join("file.c")).unwrap(),
-        CONDITIONAL
-    );
-}
-
-#[test]
-fn known_missing_option_values_fail_the_whole_plan_before_prefix_execution() {
-    let root = tempfile::tempdir().unwrap();
-    let registry = Registry::default();
     for option in [
         "-D",
         "--define",
         "-U",
         "--undef",
+        "-g",
         "--gag",
+        "-k",
         "--discard",
+        "-x",
         "--conflict",
         "--max-expansion",
+        "-F",
         "--filter",
+        "-f",
         "--file",
+        "-b",
         "--backup",
         "--define=",
+        "--filter=",
     ] {
-        let text = format!("touch should-not-exist\ncoan source -r {option}\n");
-        let error = rusty_make::parse_plan(&text, root.path(), &registry).unwrap_err();
+        let argv = ["coan", "source", "--future-option", option].map(str::to_owned);
+        let error = Coan::parse(&argv, &ShellHints::default()).unwrap_err();
         assert!(
             format!("{error:#}").contains("requires"),
             "{option}: {error:#}"
         );
-        assert!(!root.path().join("should-not-exist").exists());
+    }
+    let job = parse("coan", &["--replace"], &[], ShellHints::default());
+    assert!(
+        job.data.unknown_effects,
+        "stdin filename lists are not a closed input set"
+    );
+}
+
+#[test]
+fn real_single_stdout_and_changed_exit_17_preserve_input() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let input = path(root.path(), "input.c");
+    let output = path(root.path(), "output.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    fs::write(&output, "old output must be truncated\n").unwrap();
+    let reference = Command::new(&coan)
+        .args(["source", "-DFEATURE=1", &input])
+        .output()
+        .unwrap();
+    assert_eq!(reference.status.code(), Some(17));
+    let job = stdout(&coan, &["-DFEATURE=1"], &input, &output);
+    assert_eq!(
+        job.argv,
+        [coan.as_str(), "source", "-DFEATURE=1", input.as_str()].map(str::to_owned)
+    );
+    job.execute().unwrap();
+    assert_eq!(fs::read(&output).unwrap(), reference.stdout);
+    assert_eq!(fs::read_to_string(&input).unwrap(), CONDITIONAL);
+}
+
+#[test]
+fn real_stdout_batch_copies_outputs_and_keeps_all_inputs_unchanged() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let inputs = [
+        path(root.path(), "first input.c"),
+        path(root.path(), "second.c"),
+    ];
+    let outputs = [
+        path(root.path(), "first output.c"),
+        path(root.path(), "second output.c"),
+    ];
+    let jobs: Vec<_> = inputs
+        .iter()
+        .zip(&outputs)
+        .map(|(input, output)| {
+            fs::write(input, CONDITIONAL).unwrap();
+            fs::write(output, "old\n").unwrap();
+            stdout(&coan, &["-DFEATURE=1", "--discard=drop"], input, output)
+        })
+        .collect();
+    batch(&jobs).unwrap();
+    for (input, output) in inputs.iter().zip(&outputs) {
+        assert_eq!(fs::read_to_string(input).unwrap(), CONDITIONAL);
+        assert_eq!(fs::read_to_string(output).unwrap(), "kept\n");
     }
 }
 
 #[test]
-fn refinement_retains_intrinsic_paths_for_registry_snapshot_restoration() {
+fn real_in_place_single_and_batch_remain_supported() {
+    let Some(coan) = reference() else { return };
     let root = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("directory")).unwrap();
-    let job = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "directory"],
-        "",
-    );
-    assert!(job.spec.unknown_effects);
-    assert_eq!(job.spec.inputs, [PathBuf::from("directory")]);
-    assert_eq!(job.spec.outputs, [PathBuf::from("directory")]);
-    let snapshot = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
-    let restored = Registry::default().restore(snapshot).unwrap();
-    assert!(restored.spec.unknown_effects);
-    assert_eq!(restored.spec.inputs, job.spec.inputs);
-    assert_eq!(restored.spec.outputs, job.spec.outputs);
+    let inputs: Vec<_> = ["single.c", "first spaced.c", "second.c"]
+        .into_iter()
+        .map(|name| path(root.path(), name))
+        .collect();
+    for input in &inputs {
+        fs::write(input, CONDITIONAL).unwrap();
+    }
+    parse(
+        &coan,
+        &["-r", "-DFEATURE=1"],
+        &[&inputs[0]],
+        ShellHints::default(),
+    )
+    .execute()
+    .unwrap();
+    let jobs: Vec<_> = inputs[1..]
+        .iter()
+        .map(|input| {
+            parse(
+                &coan,
+                &["--replace", "-DFEATURE=1"],
+                &[input],
+                ShellHints::default(),
+            )
+        })
+        .collect();
+    batch(&jobs).unwrap();
+    for input in inputs {
+        assert_eq!(fs::read_to_string(input).unwrap(), "kept\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn real_compatible_stdout_batch_has_one_aggregate_failure() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let bad = path(root.path(), "bad.c");
+    let good = path(root.path(), "good.c");
+    let bad_output = path(root.path(), "bad output.c");
+    let good_output = path(root.path(), "good output.c");
+    fs::write(&bad, BROKEN).unwrap();
+    fs::write(&good, CONDITIONAL).unwrap();
+    let jobs = [
+        stdout(&coan, &["-K", "-DFEATURE=1"], &bad, &bad_output),
+        stdout(&coan, &["-K", "-DFEATURE=1"], &good, &good_output),
+    ];
+    assert!(batch(&jobs).is_err());
+    // Sequential execution would stop at bad.c. --keepgoing processing good.c
+    // proves that the failure belongs to one actual external batch.
+    assert_eq!(fs::read_to_string(good_output).unwrap(), "kept\n");
+    assert_eq!(fs::read_to_string(bad).unwrap(), BROKEN);
+    assert_eq!(fs::read_to_string(good).unwrap(), CONDITIONAL);
+}
+
+#[cfg(unix)]
+#[test]
+fn real_in_place_batch_also_returns_aggregate_error() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let bad = path(root.path(), "bad.c");
+    let good = path(root.path(), "good.c");
+    fs::write(&bad, BROKEN).unwrap();
+    fs::write(&good, CONDITIONAL).unwrap();
+    let jobs = [
+        parse(
+            &coan,
+            &["-r", "-K", "-DFEATURE=1"],
+            &[&bad],
+            ShellHints::default(),
+        ),
+        parse(
+            &coan,
+            &["-r", "-K", "-DFEATURE=1"],
+            &[&good],
+            ShellHints::default(),
+        ),
+    ];
+    assert!(batch(&jobs).is_err());
+    assert_eq!(fs::read_to_string(good).unwrap(), "kept\n");
 }
 
 #[test]
-fn missing_generated_inputs_remain_conditionally_precise_and_persistable() {
+fn real_differing_arguments_failure_policy_and_stderr_do_not_fuse() {
+    let Some(coan) = reference() else { return };
     let root = tempfile::tempdir().unwrap();
-    let job = record(
-        root.path(),
-        "coan",
-        &["source", "-r", "-DFEATURE=1", "generated.c"],
-        "",
+    for difference in ["args", "failure", "stderr"] {
+        let bad = path(root.path(), &format!("bad-{difference}.c"));
+        let good = path(root.path(), &format!("good-{difference}.c"));
+        let bad_out = path(root.path(), &format!("bad-{difference}-out.c"));
+        let good_out = path(root.path(), &format!("good-{difference}-out.c"));
+        fs::write(&bad, BROKEN).unwrap();
+        fs::write(&good, CONDITIONAL).unwrap();
+        let first = stdout(&coan, &["-K", "-DFEATURE=1"], &bad, &bad_out);
+        let mut second = stdout(
+            &coan,
+            if difference == "args" {
+                &["-K", "-UFEATURE"]
+            } else {
+                &["-K", "-DFEATURE=1"]
+            },
+            &good,
+            &good_out,
+        );
+        if difference == "failure" {
+            second.data.shell.ignore_failure = true;
+        }
+        if difference == "stderr" {
+            second.data.shell.stderr = Some("/dev/null".into());
+        }
+        assert!(batch(&[first, second]).is_err());
+        assert!(
+            !Path::new(&good_out).exists(),
+            "{difference} must retain command boundaries"
+        );
+    }
+}
+
+#[test]
+fn real_filename_sensitive_line_and_filter_options_keep_single_boundaries() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    for options in [
+        vec!["-K", "-DFEATURE=1", "--line"],
+        vec!["-K", "-DFEATURE=1", "--filter=c"],
+    ] {
+        let bad = path(root.path(), "bad.c");
+        let good = path(root.path(), "good.c");
+        let bad_out = path(root.path(), "bad.out");
+        let good_out = path(root.path(), "good.out");
+        fs::write(&bad, BROKEN).unwrap();
+        fs::write(&good, CONDITIONAL).unwrap();
+        let jobs = [
+            stdout(&coan, &options, &bad, &bad_out),
+            stdout(&coan, &options, &good, &good_out),
+        ];
+        assert!(batch(&jobs).is_err());
+        assert!(!Path::new(&good_out).exists());
+    }
+    let input = path(root.path(), "line-input.c");
+    let output = path(root.path(), "line-output.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    let expected = Command::new(&coan)
+        .args(["source", "-DFEATURE=1", "--line", &input])
+        .output()
+        .unwrap();
+    stdout(&coan, &["-DFEATURE=1", "--line"], &input, &output)
+        .execute()
+        .unwrap();
+    assert_eq!(fs::read(output).unwrap(), expected.stdout);
+}
+
+#[test]
+fn real_failure_policy_masks_status_start_and_redirection_errors() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let input = path(root.path(), "bad.c");
+    let output = path(root.path(), "out.c");
+    fs::write(&input, BROKEN).unwrap();
+    let mut job = stdout(&coan, &["-DFEATURE=1"], &input, &output);
+    assert!(job.execute().is_err());
+    job.data.shell.ignore_failure = true;
+    job.execute().unwrap();
+    let missing = "rusty-make-test-no-such-coan-executable";
+    let mut job = parse(missing, &["--future-option"], &[], ShellHints::default());
+    assert!(job.execute().is_err());
+    job.data.shell.ignore_failure = true;
+    job.execute().unwrap();
+    let directory = path(root.path(), "directory");
+    fs::create_dir(&directory).unwrap();
+    let mut job = parse(
+        &coan,
+        &["--future-option"],
+        &[],
+        ShellHints::new(Some(directory), None, false),
     );
-    assert_eq!(job.spec.unknown_effects, !cfg!(unix));
-    assert_eq!(job.spec.inputs, [PathBuf::from("generated.c")]);
-    assert_eq!(job.spec.outputs, [PathBuf::from("generated.c")]);
-    let snapshot = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
-    let restored = Registry::default().restore(snapshot).unwrap();
-    assert_eq!(restored.spec.unknown_effects, !cfg!(unix));
-    #[cfg(unix)]
-    assert!(
-        restored
-            .typed::<Coan>()
-            .unwrap()
-            .validate(&restored, root.path())
-            .is_err()
-    );
-    let graph = rusty_make::parse_plan(
-        "cp template.c generated.c\ncoan source -r -DFEATURE=1 generated.c\n",
-        root.path(),
-        &Registry::default(),
-    )
-    .unwrap();
-    assert_eq!(graph.jobs[1].spec.unknown_effects, !cfg!(unix));
+    assert!(job.execute().is_err());
+    job.data.shell.ignore_failure = true;
+    job.execute().unwrap();
+}
+
+#[test]
+fn real_ignored_aggregate_error_is_success_without_modifying_inputs() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let jobs: Vec<_> = [("bad.c", BROKEN), ("good.c", CONDITIONAL)]
+        .into_iter()
+        .map(|(name, content)| {
+            let input = path(root.path(), name);
+            let output = path(root.path(), &format!("out-{name}"));
+            fs::write(&input, content).unwrap();
+            let mut job = stdout(&coan, &["-K", "-DFEATURE=1"], &input, &output);
+            job.data.shell.ignore_failure = true;
+            job
+        })
+        .collect();
+    batch(&jobs).unwrap();
+    assert_eq!(fs::read_to_string(&jobs[1].outputs[0]).unwrap(), "kept\n");
+    assert_eq!(fs::read_to_string(&jobs[0].inputs[0]).unwrap(), BROKEN);
+}
+
+#[test]
+fn real_generated_inputs_follow_their_producers() {
+    use rusty_make::commands::cp::Cp;
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let template = path(root.path(), "template.c");
+    fs::write(&template, CONDITIONAL).unwrap();
+    let mut jobs: Vec<Box<dyn Job>> = Vec::new();
+    let mut outputs = Vec::new();
+    for name in ["one", "two"] {
+        let generated = path(root.path(), &format!("{name} generated.c"));
+        let output = path(root.path(), &format!("{name} transformed.c"));
+        let argv = vec!["cp".into(), template.clone(), generated.clone()];
+        jobs.push(Box::new(Cp::parse(&argv, &ShellHints::default()).unwrap()));
+        jobs.push(Box::new(stdout(
+            &coan,
+            &["-DFEATURE=1"],
+            &generated,
+            &output,
+        )));
+        outputs.push(output);
+    }
+    let graph = rusty_make::graph::create_graph(jobs).unwrap();
     assert!(
         graph
             .edges
             .iter()
             .any(|edge| edge.from == 0 && edge.to == 1)
     );
-}
-
-#[test]
-fn real_generated_replacement_targets_execute_after_the_producer() {
-    let Some(coan) = reference() else { return };
-    let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("template.c"), CONDITIONAL).unwrap();
-    let registry = Registry::default();
-    let records = vec![
-        registry
-            .classify(source("cp template.c 'first generated.c'"))
-            .unwrap(),
-        registry
-            .classify(source("cp template.c 'second generated.c'"))
-            .unwrap(),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-DFEATURE=1", "first generated.c"],
-            "",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-DFEATURE=1", "second generated.c"],
-            "",
-        ),
-    ];
     assert!(
-        records[2..]
+        graph
+            .edges
             .iter()
-            .all(|record| record.spec.unknown_effects == !cfg!(unix))
+            .any(|edge| edge.from == 2 && edge.to == 3)
     );
-    let graph = rusty_make::graph::BuildGraph::new(records, root.path()).unwrap();
-    let report =
-        rusty_make::scheduler::run(&graph, &rusty_make::scheduler::RunOptions::default()).unwrap();
-    assert_eq!(report.executed, 4);
-    for name in ["first generated.c", "second generated.c"] {
-        assert_eq!(
-            fs::read_to_string(root.path().join(name)).unwrap(),
-            "kept\n"
-        );
+    graph.check_inputs().unwrap();
+    rusty_make::scheduler::execute(&graph, false).unwrap();
+    for output in outputs {
+        assert_eq!(fs::read_to_string(output).unwrap(), "kept\n");
     }
+    assert_eq!(fs::read_to_string(template).unwrap(), CONDITIONAL);
 }
 
 #[test]
-fn real_quiet_null_redirects_and_noop_fallback_preserve_coan_status() {
-    let Some(coan) = reference() else { return };
+fn direct_guards_reject_aliases_and_nonregular_files_before_truncation() {
     let root = tempfile::tempdir().unwrap();
-    for redirect in [
-        " > /dev/null",
-        " 2> /dev/null",
-        " > /dev/null 2> /dev/null || cd .",
-    ] {
-        fs::write(root.path().join("quiet.c"), CONDITIONAL).unwrap();
-        let job = record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-DFEATURE=1", "quiet.c"],
-            redirect,
-        );
-        #[cfg(unix)]
-        assert!(!job.spec.unknown_effects);
-        assert_eq!(job.spec.inputs, [PathBuf::from("quiet.c")]);
-        assert_eq!(job.spec.outputs, [PathBuf::from("quiet.c")]);
-        execute(&job, root.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(root.path().join("quiet.c")).unwrap(),
-            "kept\n"
-        );
+    let input = path(root.path(), "input.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    let error = stdout("coan", &["-DFEATURE=1"], &input, &input)
+        .execute()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("alias"));
+    assert_eq!(fs::read_to_string(&input).unwrap(), CONDITIONAL);
+    let directory = path(root.path(), "directory");
+    fs::create_dir(&directory).unwrap();
+    let error = parse("coan", &["-r"], &[&directory], ShellHints::default())
+        .execute()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("regular"));
+    let alias = path(root.path(), "alias.c");
+    fs::hard_link(&input, &alias).unwrap();
+    #[cfg(unix)]
+    {
+        let error = parse("coan", &["-r"], &[&input], ShellHints::default())
+            .execute()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("hard-link"));
     }
-    let bad = record(
-        root.path(),
-        &coan,
-        &["source", "--not-a-real-coan-option"],
-        " > /dev/null 2> /dev/null || cd .",
-    );
-    assert!(bad.shell.as_ref().unwrap().noop_fallback);
-    assert!(
-        execute(&bad, root.path()).is_err(),
-        "cd . must not mask a coan error"
-    );
-    assert!(!root.path().join("NUL").exists());
+    let error = stdout("coan", &["-DFEATURE=1"], &input, &alias)
+        .execute()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("alias"));
+    assert_eq!(fs::read_to_string(&input).unwrap(), CONDITIONAL);
 }
 
 #[cfg(unix)]
 #[test]
-fn real_quiet_compatible_jobs_batch_and_aggregate_failures() {
-    let Some(coan) = reference() else { return };
+fn symlinked_files_and_parent_components_are_rejected() {
+    use std::os::unix::fs::symlink;
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("good.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("bad.c"), "#ifdef FEATURE\nunterminated\n").unwrap();
-    let records = [
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "good.c"],
-            " > /dev/null 2> /dev/null || cd .",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "bad.c"],
-            " > /dev/null 2> /dev/null || cd .",
-        ),
-    ];
-    assert!(records.iter().all(|record| !record.spec.unknown_effects));
-    let report = batch(&records, root.path(), &AtomicBool::new(false));
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(report.outcomes.iter().all(|(_, result)| result.is_err()));
-    assert_eq!(
-        fs::read_to_string(root.path().join("good.c")).unwrap(),
-        "kept\n"
-    );
+    let input = path(root.path(), "input.c");
+    let alias = path(root.path(), "alias.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    symlink(&input, &alias).unwrap();
+    let error = parse("coan", &["-r"], &[&alias], ShellHints::default())
+        .execute()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("symlink"));
+    let parent = root.path().join("linked");
+    symlink(root.path(), &parent).unwrap();
+    let output = path(&parent, "output.c");
+    let error = stdout("coan", &["-DFEATURE=1"], &input, &output)
+        .execute()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("symlink"));
+    assert_eq!(fs::read_to_string(&input).unwrap(), CONDITIONAL);
 }
 
 #[cfg(unix)]
 #[test]
-fn real_different_quiet_settings_do_not_share_aggregate_status() {
+fn real_quotes_and_newlines_use_original_argv_not_stdin_lists() {
     let Some(coan) = reference() else { return };
     let root = tempfile::tempdir().unwrap();
-    fs::write(root.path().join("good.c"), CONDITIONAL).unwrap();
-    fs::write(root.path().join("bad.c"), "#ifdef FEATURE\nunterminated\n").unwrap();
-    let records = [
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "good.c"],
-            "",
-        ),
-        record(
-            root.path(),
-            &coan,
-            &["source", "-r", "-K", "-DFEATURE=1", "bad.c"],
-            " 2> /dev/null",
-        ),
+    let jobs: Vec<_> = [
+        "quoted\"name.c",
+        "line\nbreak.c",
+        "tab\tname.c",
+        "vertical\u{b}name.c",
+        "form\u{c}name.c",
+    ]
+    .into_iter()
+    .map(|name| {
+        let input = path(root.path(), &format!("input-{name}"));
+        let output = path(root.path(), &format!("output-{name}"));
+        fs::write(&input, CONDITIONAL).unwrap();
+        stdout(&coan, &["-DFEATURE=1"], &input, &output)
+    })
+    .collect();
+    batch(&jobs).unwrap();
+    for job in jobs {
+        assert_eq!(fs::read_to_string(&job.outputs[0]).unwrap(), "kept\n");
+        assert_eq!(fs::read_to_string(&job.inputs[0]).unwrap(), CONDITIONAL);
+    }
+}
+
+#[test]
+fn real_noop_suffixes_apply_their_shell_failure_policy() {
+    let Some(coan) = reference() else { return };
+    for suffix in ["true", ":", "cd ."] {
+        let text = format!(
+            "{} source --not-a-real-coan-option 2> /dev/null || {suffix}",
+            shell_words::quote(&coan)
+        );
+        let parsed = rusty_make::shell::parse(&text).unwrap();
+        assert!(parsed.shell.ignore_failure);
+        let mut job = Coan::parse(&parsed.argv, &parsed.shell).unwrap();
+        job.data.shell = parsed.shell;
+        job.execute().unwrap();
+    }
+}
+
+#[test]
+fn real_conflicting_paths_keep_sequential_command_boundaries() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let input = path(root.path(), "input.c");
+    let intermediate = path(root.path(), "intermediate.c");
+    let output = path(root.path(), "output.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    let jobs = [
+        stdout(&coan, &["-DFEATURE=1"], &input, &intermediate),
+        stdout(&coan, &["-DFEATURE=1"], &intermediate, &output),
     ];
-    let report = batch(&records, root.path(), &AtomicBool::new(false));
-    assert_eq!(report.outcomes.len(), 2);
-    assert!(
-        report
-            .outcomes
-            .iter()
-            .find(|(id, _)| *id == 0)
-            .unwrap()
-            .1
-            .is_ok()
-    );
-    assert!(
-        report
-            .outcomes
-            .iter()
-            .find(|(id, _)| *id == 1)
-            .unwrap()
-            .1
-            .is_err()
-    );
+    batch(&jobs).unwrap();
+    assert_eq!(fs::read_to_string(output).unwrap(), "kept\n");
+    assert_eq!(fs::read_to_string(input).unwrap(), CONDITIONAL);
+}
+
+#[test]
+fn real_ignored_missing_input_does_not_skip_later_valid_job() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let missing = path(root.path(), "missing.c");
+    let input = path(root.path(), "input.c");
+    let missing_output = path(root.path(), "missing-out.c");
+    let output = path(root.path(), "output.c");
+    fs::write(&input, CONDITIONAL).unwrap();
+    let mut jobs = [
+        stdout(&coan, &["-DFEATURE=1"], &missing, &missing_output),
+        stdout(&coan, &["-DFEATURE=1"], &input, &output),
+    ];
+    for job in &mut jobs {
+        job.data.shell.ignore_failure = true;
+    }
+    batch(&jobs).unwrap();
+    assert_eq!(fs::read_to_string(output).unwrap(), "kept\n");
+    assert_eq!(fs::read_to_string(input).unwrap(), CONDITIONAL);
+}
+
+#[test]
+fn real_stdout_batches_preserve_filename_sensitive_conflict_text() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    for policy in ["--conflict=comment", "--conflict=error"] {
+        let mut jobs = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..2 {
+            let input = path(root.path(), &format!("input-{index}.c"));
+            let output = path(root.path(), &format!("output-{index}.c"));
+            fs::write(&input, "#undef FEATURE\n").unwrap();
+            expected.push(
+                Command::new(&coan)
+                    .args(["source", "-DFEATURE=1", policy, &input])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            );
+            jobs.push(stdout(&coan, &["-DFEATURE=1", policy], &input, &output));
+        }
+        batch(&jobs).unwrap();
+        for (job, bytes) in jobs.iter().zip(expected) {
+            assert_eq!(fs::read(&job.outputs[0]).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn real_ignored_stdout_batch_errors_preserve_emitted_prefixes() {
+    let Some(coan) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let mut jobs = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..2 {
+        let input = path(root.path(), &format!("broken-{index}.c"));
+        let output = path(root.path(), &format!("output-{index}.c"));
+        fs::write(&input, "before\n#ifdef FEATURE\nkept\n").unwrap();
+        expected.push(
+            Command::new(&coan)
+                .args(["source", "-DFEATURE=1", &input])
+                .output()
+                .unwrap()
+                .stdout,
+        );
+        let mut job = stdout(&coan, &["-DFEATURE=1"], &input, &output);
+        job.data.shell.ignore_failure = true;
+        jobs.push(job);
+    }
+    batch(&jobs).unwrap();
+    for (job, bytes) in jobs.iter().zip(expected) {
+        assert_eq!(fs::read(&job.outputs[0]).unwrap(), bytes);
+    }
 }

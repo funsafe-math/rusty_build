@@ -1,393 +1,429 @@
 use rusty_make::{
-    graph::{BuildGraph, Edge},
-    input::SourceCommand,
-    job::{ExecutionContext, Job, JobRecord},
+    graph::{Dag, Edge, create_graph},
+    job::{FileAccess, Job, JobData, Producer},
+    rewrite::optimize_graph,
 };
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{cell::RefCell, rc::Rc};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TestEffects {
-    inputs: Vec<PathBuf>,
-    outputs: Vec<PathBuf>,
-    unknown: bool,
+#[derive(Debug)]
+struct Effects {
+    data: JobData,
 }
-impl Job for TestEffects {
-    const TYPE: &'static str = "test.effects";
-    fn parse(_: &rusty_make::shell::ShellCommand) -> anyhow::Result<Self> {
-        anyhow::bail!("graph-effect fixtures are constructed directly")
+impl Job for Effects {
+    fn data(&self) -> &JobData {
+        &self.data
     }
-    fn inputs(&self) -> impl Iterator<Item = &Path> {
-        self.inputs.iter().map(PathBuf::as_path)
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
     }
-    fn outputs(&self) -> impl Iterator<Item = &Path> {
-        self.outputs.iter().map(PathBuf::as_path)
-    }
-    fn unknown_effects(&self) -> bool {
-        self.unknown
-    }
-    fn execute(&self, ctx: &ExecutionContext<'_>) -> anyhow::Result<()> {
-        rusty_make::commands::external::execute_original(ctx)
+    fn execute(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
-fn job(inputs: &[&str], outputs: &[&str], unknown: bool) -> JobRecord {
-    JobRecord::new(
-        SourceCommand {
-            line: 1,
-            text: "test effect".into(),
-            target: None,
-        },
-        None,
-        TestEffects {
-            inputs: inputs.iter().map(PathBuf::from).collect(),
-            outputs: outputs.iter().map(PathBuf::from).collect(),
-            unknown,
-        },
-    )
-    .unwrap()
+fn job(accesses: Vec<FileAccess>) -> Box<dyn Job> {
+    Box::new(Effects {
+        data: JobData::new(accesses),
+    })
 }
-fn graph(jobs: Vec<JobRecord>) -> BuildGraph {
-    BuildGraph::new(jobs, &std::env::current_dir().unwrap()).unwrap()
+fn unknown() -> Box<dyn Job> {
+    let mut item = job(Vec::new());
+    item.data_mut().unknown_effects = true;
+    item
 }
-#[test]
-fn independent_jobs_and_branching_multiple_io() {
-    let g = graph(vec![
-        job(&["a"], &["x", "y"], false),
-        job(&["b"], &["z"], false),
-        job(&["x", "z"], &["q"], false),
-        job(&["y"], &["r"], false),
-    ]);
-    assert_eq!(g.waves, vec![vec![0, 1], vec![2, 3]]);
-    assert_eq!(
-        g.edges.iter().map(|e| (e.from, e.to)).collect::<Vec<_>>(),
-        vec![(0, 2), (1, 2), (0, 3)]
-    );
-}
-#[test]
-fn versions_preserve_in_place_reads_and_write_after_read() {
-    let g = graph(vec![
-        job(&["a"], &["b"], false),
-        job(&["b"], &["c"], false),
-        job(&["b"], &["b"], false),
-        job(&["b"], &["d"], false),
-    ]);
-    assert_eq!(g.reads[1][0].version, 1);
-    assert_eq!(g.reads[2][0].version, 1);
-    assert_eq!(g.writes[2][0].version, 2);
-    assert_eq!(g.reads[3][0].version, 2);
-    assert!(
-        g.edges
-            .iter()
-            .any(|e| e.from == 1 && e.to == 2 && e.reason == "write after read")
-    );
-    assert_eq!(g.waves, vec![vec![0], vec![1], vec![2], vec![3]]);
-}
-#[test]
-fn directory_prerequisites_and_duplicate_writers_are_ordered() {
-    let g = graph(vec![
-        job(&[], &["build"], false),
-        job(&["a"], &["build/x"], false),
-        job(&["b"], &["build/x"], false),
-    ]);
-    assert_eq!(g.waves, vec![vec![0], vec![1], vec![2]]);
-}
-#[test]
-fn unknown_effects_are_global_barriers() {
-    let g = graph(vec![
-        job(&[], &["a"], false),
-        job(&[], &["b"], false),
-        job(&[], &[], true),
-        job(&[], &["c"], false),
-        job(&[], &["d"], false),
-    ]);
-    assert_eq!(g.waves, vec![vec![0, 1], vec![2], vec![3, 4]]);
-}
-#[test]
-fn cycle_errors_identify_commands() {
-    let mut g = graph(vec![job(&[], &["a"], false), job(&["a"], &["b"], false)]);
-    g.edges.push(Edge {
-        from: 1,
-        to: 0,
-        reason: "test cycle".into(),
+fn bind(mut consumer: Box<dyn Job>, input: &str, producer: usize) -> Box<dyn Job> {
+    consumer.data_mut().producers.push(Producer {
+        input: input.into(),
+        job: producer,
     });
-    let error = g.topological_waves().unwrap_err().to_string();
-    assert!(error.contains("cycle") && error.contains("test effect"));
+    consumer
 }
-#[test]
-fn relative_absolute_paths_refer_to_same_artifact() {
-    let cwd = std::env::current_dir().unwrap();
-    let absolute = cwd.join("build/path");
-    let g = graph(vec![
-        job(&[], &["./build/path"], false),
-        job(&[absolute.to_str().unwrap()], &["x"], false),
-    ]);
-    assert_eq!(g.waves, vec![vec![0], vec![1]]);
-}
-#[cfg(unix)]
-#[test]
-fn symlink_parent_dotdot_resolves_in_filesystem_order() {
-    use rusty_make::graph::normalize;
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join("actual/child")).unwrap();
-    std::os::unix::fs::symlink(root.path().join("actual/child"), root.path().join("link")).unwrap();
-    assert_eq!(
-        normalize(root.path(), std::path::Path::new("link/../missing")),
-        root.path().join("actual/missing")
-    );
-}
-
-#[test]
-fn mkdir_parents_orders_sibling_output_using_implicit_parent() {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("source"), "payload").unwrap();
-    let graph = rusty_make::parse_plan(
-        "mkdir -p build/nested\ncp source build/sibling\n",
-        root.path(),
-        &rusty_make::registry::Registry::default(),
-    )
-    .unwrap();
-    assert_eq!(graph.waves, vec![vec![0], vec![1]]);
-    rusty_make::scheduler::run(
-        &graph,
-        &rusty_make::scheduler::RunOptions {
-            jobs: 2,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(root.path().join("build/sibling")).unwrap(),
-        "payload"
-    );
-}
-
-fn reachability(graph: &BuildGraph) -> Vec<Vec<bool>> {
-    let mut children = vec![Vec::new(); graph.jobs.len()];
-    for edge in &graph.edges {
-        children[edge.from].push(edge.to);
-    }
-    (0..graph.jobs.len())
-        .map(|start| {
-            let mut reached = vec![false; graph.jobs.len()];
-            let mut pending = children[start].clone();
-            while let Some(node) = pending.pop() {
-                if !reached[node] {
-                    reached[node] = true;
-                    pending.extend_from_slice(&children[node]);
-                }
+fn reaches(dag: &Dag, from: usize, to: usize) -> bool {
+    let mut pending = vec![from];
+    let mut visited = vec![false; dag.jobs.len()];
+    while let Some(node) = pending.pop() {
+        if visited[node] {
+            continue;
+        }
+        visited[node] = true;
+        for edge in dag.edges.iter().filter(|edge| edge.from == node) {
+            if edge.to == to {
+                return true;
             }
-            reached
-        })
-        .collect()
+            pending.push(edge.to);
+        }
+    }
+    false
 }
 
 #[test]
-fn indexed_hazards_and_frontiers_match_dense_ordering_and_waves() {
+fn independent_jobs_and_branching_multiple_accesses() {
+    let dag = create_graph(vec![
+        job(vec![
+            FileAccess::read("a"),
+            FileAccess::write("x"),
+            FileAccess::write("y"),
+        ]),
+        job(vec![FileAccess::read("b"), FileAccess::write("z")]),
+        job(vec![
+            FileAccess::read("x"),
+            FileAccess::read("z"),
+            FileAccess::write("q"),
+        ]),
+        job(vec![FileAccess::read("y"), FileAccess::write("r")]),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![0, 1], vec![2, 3]]);
+    assert_eq!(dag.unproduced, vec![vec!["a"], vec!["b"], vec![], vec![]]);
+}
+
+#[test]
+fn raw_war_waw_and_read_modify_write_preserve_values() {
+    let dag = create_graph(vec![
+        job(vec![FileAccess::write("value")]),
+        job(vec![FileAccess::read("value")]),
+        job(vec![FileAccess::read_write("value")]),
+        job(vec![FileAccess::read("value")]),
+        job(vec![FileAccess::write("value")]),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![0], vec![1], vec![2], vec![3], vec![4]]);
+    assert!(dag.unproduced.iter().all(Vec::is_empty));
+    assert!(dag.edges.iter().all(|edge| edge.from != edge.to));
+}
+
+#[test]
+fn read_before_first_write_and_initial_read_write_are_unproduced() {
+    let dag = create_graph(vec![
+        job(vec![FileAccess::read("value"), FileAccess::read("value")]),
+        job(vec![FileAccess::read_write("value")]),
+        job(vec![FileAccess::read_write("initial")]),
+    ])
+    .unwrap();
+    assert_eq!(
+        dag.unproduced,
+        vec![vec!["value"], vec!["value"], vec!["initial"]]
+    );
+    assert!(reaches(&dag, 0, 1));
+}
+
+#[test]
+fn explicit_later_producer_selects_its_value_and_guards_next_overwrite() {
+    let dag = create_graph(vec![
+        bind(job(vec![FileAccess::read("header")]), "header", 2),
+        job(vec![FileAccess::write("header")]),
+        job(vec![FileAccess::write("header")]),
+        job(vec![FileAccess::write("header")]),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![1], vec![2], vec![0], vec![3]]);
+    assert!(dag.unproduced[0].is_empty());
+}
+
+#[test]
+fn explicit_preceding_producer_reads_before_a_later_overwrite() {
+    let dag = create_graph(vec![
+        job(vec![FileAccess::write("value")]),
+        job(vec![FileAccess::write("value")]),
+        bind(job(vec![FileAccess::read("value")]), "value", 0),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![0], vec![2], vec![1]]);
+}
+
+#[test]
+fn directory_hazards_include_ancestors_descendants_but_not_siblings() {
+    let dag = create_graph(vec![
+        job(vec![FileAccess::write("build")]),
+        job(vec![FileAccess::write("build/a")]),
+        job(vec![FileAccess::write("build/b")]),
+        job(vec![FileAccess::read("build")]),
+        job(vec![FileAccess::write("build/a/nested")]),
+        job(vec![FileAccess::write("build-other/a")]),
+    ])
+    .unwrap();
+    assert!(reaches(&dag, 0, 1) && reaches(&dag, 0, 2));
+    assert!(!reaches(&dag, 1, 2) && !reaches(&dag, 2, 1));
+    assert!(reaches(&dag, 1, 3) && reaches(&dag, 2, 3));
+    assert!(reaches(&dag, 3, 4));
+    assert!(!reaches(&dag, 0, 5));
+}
+
+#[test]
+fn absolute_root_and_trailing_directory_slashes_preserve_hazards() {
+    let dag = create_graph(vec![
+        job(vec![FileAccess::write("/")]),
+        job(vec![FileAccess::read("/absolute/file")]),
+        job(vec![FileAccess::write("relative/")]),
+        job(vec![FileAccess::read("relative/file")]),
+    ])
+    .unwrap();
+    assert!(reaches(&dag, 0, 1));
+    assert!(reaches(&dag, 2, 3));
+    assert!(!reaches(&dag, 0, 3));
+}
+
+#[test]
+fn ancestor_writer_can_bind_a_descendant_input() {
+    let dag = create_graph(vec![
+        bind(
+            job(vec![FileAccess::read("generated/a.h")]),
+            "generated/a.h",
+            1,
+        ),
+        job(vec![FileAccess::write("generated")]),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![1], vec![0]]);
+}
+
+#[test]
+fn ancestor_writes_do_not_supply_missing_descendant_inputs() {
     let root = tempfile::tempdir().unwrap();
-    let paths = ["a", "a/one", "a/two", "b", "b/one", "c", "c/deep/file", "d"];
-    for seed in 1..=6u64 {
-        let mut state = seed;
-        let mut next = || {
+    let directory = root.path().join("generated").to_str().unwrap().to_owned();
+    let missing = format!("{directory}/absent.h");
+    let dag = create_graph(vec![
+        job(vec![FileAccess::write(directory)]),
+        job(vec![FileAccess::read(missing)]),
+    ])
+    .unwrap();
+    assert!(reaches(&dag, 0, 1));
+    assert!(dag.check_inputs().is_err());
+}
+
+#[test]
+fn reversed_unknown_producers_preserve_unrelated_barriers() {
+    let mut consumer = bind(unknown(), "x", 1);
+    consumer.data_mut().accesses.push(FileAccess::read("x"));
+    let mut producer = unknown();
+    producer.data_mut().accesses.push(FileAccess::write("x"));
+    let dag = create_graph(vec![consumer, producer, unknown()]).unwrap();
+    assert!(reaches(&dag, 1, 0));
+    assert!(reaches(&dag, 0, 2));
+    let mut consumer = bind(bind(unknown(), "x", 1), "z", 3);
+    consumer
+        .data_mut()
+        .accesses
+        .extend([FileAccess::read("x"), FileAccess::read("z")]);
+    let mut producer = unknown();
+    producer.data_mut().accesses.push(FileAccess::write("x"));
+    assert!(
+        create_graph(vec![
+            consumer,
+            producer,
+            unknown(),
+            job(vec![FileAccess::write("z")]),
+        ])
+        .unwrap_err()
+        .to_string()
+        .contains("cycle")
+    );
+}
+
+#[test]
+fn unknown_effect_barriers_are_sparse_and_keep_segment_jobs_independent() {
+    let mut jobs: Vec<_> = (0..500)
+        .map(|i| job(vec![FileAccess::write(format!("left/{i}"))]))
+        .collect();
+    jobs.push(unknown());
+    jobs.extend((0..499).map(|i| job(vec![FileAccess::write(format!("right/{i}"))])));
+    let dag = create_graph(jobs).unwrap();
+    assert_eq!(
+        dag.waves.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![500, 1, 499]
+    );
+    assert_eq!(dag.edges.len(), 999);
+    let all_barriers = create_graph((0..1000).map(|_| unknown()).collect()).unwrap();
+    assert_eq!(all_barriers.edges.len(), 999);
+}
+
+#[test]
+fn unknown_barrier_respects_producer_direction_but_not_intervening_cycles() {
+    let mut consumer = bind(job(vec![FileAccess::read("header")]), "header", 1);
+    consumer.data_mut().unknown_effects = true;
+    let dag = create_graph(vec![
+        consumer,
+        job(vec![FileAccess::write("header")]),
+        unknown(),
+    ])
+    .unwrap();
+    assert_eq!(dag.waves, vec![vec![1], vec![0], vec![2]]);
+    let mut consumer = bind(job(vec![FileAccess::read("header")]), "header", 2);
+    consumer.data_mut().unknown_effects = true;
+    let error = create_graph(vec![
+        consumer,
+        unknown(),
+        job(vec![FileAccess::write("header")]),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("cycle"));
+}
+
+#[test]
+fn explicit_bindings_reject_cycles_and_invalid_producers() {
+    let cycle = create_graph(vec![
+        bind(
+            job(vec![FileAccess::read("b"), FileAccess::write("a")]),
+            "b",
+            1,
+        ),
+        job(vec![FileAccess::read("a"), FileAccess::write("b")]),
+    ])
+    .unwrap_err();
+    assert!(cycle.to_string().contains("cycle"));
+    assert!(create_graph(vec![bind(job(vec![FileAccess::read("x")]), "x", 8)]).is_err());
+    assert!(
+        create_graph(vec![
+            bind(job(vec![FileAccess::read("x")]), "x", 1),
+            job(vec![FileAccess::write("other")])
+        ])
+        .is_err()
+    );
+    assert!(
+        create_graph(vec![
+            bind(job(vec![]), "x", 1),
+            job(vec![FileAccess::write("x")])
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn graph_construction_never_checks_files_but_check_inputs_does() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("absent").to_str().unwrap().to_owned();
+    let dag = create_graph(vec![job(vec![FileAccess::read_write(missing.clone())])]).unwrap();
+    assert!(dag.check_inputs().is_err());
+    let dag = create_graph(vec![
+        bind(job(vec![FileAccess::read(missing.clone())]), &missing, 1),
+        job(vec![FileAccess::write(missing)]),
+    ])
+    .unwrap();
+    dag.check_inputs().unwrap();
+}
+
+#[derive(Debug)]
+struct InputObserver {
+    data: JobData,
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+}
+impl Job for InputObserver {
+    fn data(&self) -> &JobData {
+        &self.data
+    }
+    fn data_mut(&mut self) -> &mut JobData {
+        &mut self.data
+    }
+    fn execute(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn check_inputs(&self, inputs: &[&str]) -> anyhow::Result<()> {
+        self.calls
+            .borrow_mut()
+            .push(inputs.iter().map(|input| (*input).to_owned()).collect());
+        Ok(())
+    }
+}
+#[test]
+fn input_checks_are_dispatched_to_the_owning_job() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let dag = create_graph(vec![Box::new(InputObserver {
+        data: JobData::new(vec![
+            FileAccess::read("initial"),
+            FileAccess::write("output"),
+        ]),
+        calls: calls.clone(),
+    })])
+    .unwrap();
+    assert!(calls.borrow().is_empty());
+    dag.check_inputs().unwrap();
+    assert_eq!(*calls.borrow(), vec![vec!["initial".to_owned()]]);
+}
+
+fn overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|tail| tail.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|tail| tail.starts_with('/'))
+}
+
+#[test]
+fn indexed_graph_matches_dense_hazard_reachability() {
+    for seed in 0..30u64 {
+        let mut state = seed + 1;
+        let mut jobs = Vec::new();
+        for _ in 0..40 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (state >> 32) as usize
-        };
-        let jobs = (0..72)
-            .map(|_| {
-                let inputs = [paths[next() % paths.len()], paths[next() % paths.len()]];
-                let outputs = [paths[next() % paths.len()], paths[next() % paths.len()]];
-                job(
-                    &inputs[..next() % 3],
-                    &outputs[..next() % 3],
-                    next() % 5 == 0,
-                )
-            })
-            .collect();
-        let actual = BuildGraph::new(jobs, root.path()).unwrap();
-        let mut dense = actual.clone();
-        dense.edges.clear();
-        for to in 0..actual.jobs.len() {
-            for from in 0..to {
-                let overlap =
-                    |left: &[rusty_make::graph::ArtifactId],
-                     right: &[rusty_make::graph::ArtifactId]| {
-                        left.iter().any(|a| {
-                            right
-                                .iter()
-                                .any(|b| a.path.starts_with(&b.path) || b.path.starts_with(&a.path))
+            let names = ["a", "a/x", "a/y", "b", "b/x", "other"];
+            let path = names[(state >> 32) as usize % names.len()];
+            let access = match state % 3 {
+                0 => FileAccess::read(path),
+                1 => FileAccess::write(path),
+                _ => FileAccess::read_write(path),
+            };
+            let mut item = job(vec![access]);
+            item.data_mut().unknown_effects = state % 13 == 0;
+            jobs.push(item);
+        }
+        let mut expected = vec![vec![false; jobs.len()]; jobs.len()];
+        for from in 0..jobs.len() {
+            for to in from + 1..jobs.len() {
+                expected[from][to] = jobs[from].data().unknown_effects
+                    || jobs[to].data().unknown_effects
+                    || jobs[from].data().accesses.iter().any(|a| {
+                        jobs[to].data().accesses.iter().any(|b| {
+                            overlap(&a.path, &b.path) && (a.access.writes() || b.access.writes())
                         })
-                    };
-                let hazard = if overlap(&actual.writes[from], &actual.reads[to]) {
-                    Some("read after write / directory prerequisite")
-                } else if overlap(&actual.writes[from], &actual.writes[to]) {
-                    Some("write after write")
-                } else if overlap(&actual.reads[from], &actual.writes[to]) {
-                    Some("write after read")
-                } else {
-                    None
-                };
-                if let Some(reason) = hazard {
-                    // Actual hazards stay directly inspectable, not just
-                    // implied by otherwise conservative barrier reachability.
-                    assert!(actual.edges.iter().any(|edge| {
-                        edge.from == from && edge.to == to && edge.reason == reason
-                    }));
-                }
-                if let Some(reason) = hazard.or_else(|| {
-                    (actual.jobs[from].spec.unknown_effects || actual.jobs[to].spec.unknown_effects)
-                        .then_some("unknown-effect or filesystem-alias ordering barrier")
-                }) {
-                    dense.edges.push(Edge {
-                        from,
-                        to,
-                        reason: reason.into(),
                     });
+            }
+        }
+        for via in 0..jobs.len() {
+            for from in 0..jobs.len() {
+                for to in 0..jobs.len() {
+                    let through = expected[from][via] && expected[via][to];
+                    expected[from][to] |= through;
                 }
             }
         }
-        assert_eq!(reachability(&actual), reachability(&dense), "seed {seed}");
-        assert_eq!(
-            actual.waves,
-            dense.topological_waves().unwrap(),
-            "seed {seed}"
-        );
-        assert!(actual.edges.iter().all(|edge| edge.from < edge.to));
-    }
-}
-
-#[test]
-fn independent_large_paths_do_not_create_edges() {
-    let root = tempfile::tempdir().unwrap();
-    let jobs = (0..4096)
-        .map(|i| {
-            job(
-                &[&format!("sources/{i}.c")],
-                &[&format!("objects/{i}.o")],
-                false,
-            )
-        })
-        .collect();
-    let graph = BuildGraph::new(jobs, root.path()).unwrap();
-    assert!(graph.edges.is_empty());
-    assert_eq!(graph.waves.len(), 1);
-    assert_eq!(graph.waves[0], (0..4096).collect::<Vec<_>>());
-}
-
-#[test]
-fn large_opaque_and_compile_barriers_have_linear_edge_counts() {
-    let root = tempfile::tempdir().unwrap();
-    let count = 4096;
-    let jobs = (0..count)
-        .map(|i| {
-            if i % 2 == 0 {
-                job(&[], &[], true)
-            } else {
-                // Compiler metadata can contain paths while remaining an
-                // unknown-effect barrier because of hidden include reads.
-                job(
-                    &[&format!("source/{i}.c")],
-                    &[&format!("object/{i}.o")],
-                    true,
-                )
+        let dag = create_graph(jobs).unwrap();
+        for (from, row) in expected.iter().enumerate() {
+            for (to, &reachable) in row.iter().enumerate() {
+                assert_eq!(
+                    reaches(&dag, from, to),
+                    reachable,
+                    "seed {seed}: {from} -> {to}"
+                );
             }
+        }
+    }
+}
+
+#[test]
+fn optimization_removes_real_transitive_edges_and_preserves_generic_reachability() {
+    let mut dag = create_graph((0..20).map(|_| job(Vec::new())).collect()).unwrap();
+    dag.edges = (0..20)
+        .flat_map(|from| {
+            (from + 1..20)
+                .filter(move |to| (from * 7 + to * 3) % 5 != 0)
+                .map(move |to| Edge { from, to })
         })
         .collect();
-    let graph = BuildGraph::new(jobs, root.path()).unwrap();
-    assert!(graph.edges.len() <= count * 2);
-    assert_eq!(graph.waves, (0..count).map(|i| vec![i]).collect::<Vec<_>>());
-}
-
-#[test]
-fn barriers_join_dependency_frontiers_not_every_earlier_job() {
-    let root = tempfile::tempdir().unwrap();
-    let groups = 32;
-    let width = 64;
-    let mut jobs = Vec::new();
-    let mut expected_waves = Vec::new();
-    for group in 0..groups {
-        let start = jobs.len();
-        for member in 0..width {
-            jobs.push(job(&[], &[&format!("output/{group}/{member}")], false));
-        }
-        expected_waves.push((start..jobs.len()).collect::<Vec<_>>());
-        expected_waves.push(vec![jobs.len()]);
-        jobs.push(job(&[], &[], true));
+    dag.waves = dag.topological_waves().unwrap();
+    let waves = dag.waves.clone();
+    let before: Vec<_> = (0..20)
+        .flat_map(|from| (0..20).map(move |to| (from, to)))
+        .map(|(from, to)| reaches(&dag, from, to))
+        .collect();
+    let original_edges = dag.edges.len();
+    optimize_graph(&mut dag).unwrap();
+    assert!(dag.edges.len() < original_edges);
+    assert_eq!(dag.waves, waves);
+    let after: Vec<_> = (0..20)
+        .flat_map(|from| (0..20).map(move |to| (from, to)))
+        .map(|(from, to)| reaches(&dag, from, to))
+        .collect();
+    assert_eq!(before, after);
+    for index in 0..dag.edges.len() {
+        let edge = dag.edges.remove(index);
+        assert!(!reaches(&dag, edge.from, edge.to));
+        dag.edges.insert(index, edge);
     }
-    let graph = BuildGraph::new(jobs, root.path()).unwrap();
-    assert!(graph.edges.len() <= graph.jobs.len() * 2);
-    assert_eq!(graph.waves, expected_waves);
-    let reached = reachability(&graph);
-    for (from, successors) in reached.iter().enumerate() {
-        for (to, &reachable) in successors.iter().enumerate() {
-            let from_group = from / (width + 1);
-            let to_group = to / (width + 1);
-            let expected = from_group < to_group
-                || (from_group == to_group && from < to && to % (width + 1) == width);
-            assert_eq!(reachable, expected, "{from} -> {to}");
-        }
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn rebuild_refreshes_symlink_normalization_and_hardlink_metadata() {
-    let root = tempfile::tempdir().unwrap();
-    let p = root.path();
-    std::fs::write(p.join("a"), "").unwrap();
-    std::fs::write(p.join("b"), "").unwrap();
-    std::os::unix::fs::symlink("a", p.join("link")).unwrap();
-    let mut graph = BuildGraph::new(
-        vec![
-            job(&[], &["a"], false),
-            job(&["link", "link"], &["other"], false),
-        ],
-        p,
-    )
-    .unwrap();
-    assert_eq!(graph.waves, vec![vec![0], vec![1]]);
-    std::fs::remove_file(p.join("link")).unwrap();
-    std::os::unix::fs::symlink("b", p.join("link")).unwrap();
-    graph.rebuild().unwrap();
-    assert_eq!(graph.waves, vec![vec![0, 1]]);
-    std::fs::hard_link(p.join("a"), p.join("alias")).unwrap();
-    graph.rebuild().unwrap();
-    assert_eq!(graph.waves, vec![vec![0], vec![1]]);
-    assert!(reachability(&graph)[0][1]);
-    std::fs::remove_file(p.join("alias")).unwrap();
-    graph.rebuild().unwrap();
-    assert_eq!(graph.waves, vec![vec![0, 1]]);
-}
-
-#[test]
-fn backward_required_headers_keep_final_versions_and_intervening_cycles() {
-    use rusty_make::graph::RequiredDependency;
-    let root = tempfile::tempdir().unwrap();
-    let make_jobs = |intervening_unknown| {
-        let mut jobs = vec![
-            job(&["generated.h"], &["main.o"], true),
-            job(&[], &["independent"], intervening_unknown),
-            job(&["template"], &["generated.h"], false),
-        ];
-        for (index, job) in jobs.iter_mut().enumerate() {
-            job.source.line = index + 1;
-        }
-        jobs
-    };
-    let dependency = RequiredDependency {
-        producer_line: 3,
-        consumer_line: 1,
-        artifact: "generated.h".into(),
-        reason: "selected generated header".into(),
-    };
-    let mut safe = BuildGraph::new(make_jobs(false), root.path()).unwrap();
-    safe.required_dependencies.push(dependency.clone());
-    safe.rebuild().unwrap();
-    assert_eq!(safe.waves, vec![vec![2], vec![0], vec![1]]);
-    assert_eq!(safe.reads[0][0].version, safe.writes[2][0].version);
-    assert!(reachability(&safe)[2][0]);
-    assert!(!reachability(&safe)[0][2]);
-    let mut unsafe_graph = BuildGraph::new(make_jobs(true), root.path()).unwrap();
-    unsafe_graph.required_dependencies.push(dependency);
-    let error = unsafe_graph.rebuild().unwrap_err().to_string();
-    assert!(error.contains("dependency cycle"));
-    assert!(error.contains("line 1") && error.contains("line 3"));
 }

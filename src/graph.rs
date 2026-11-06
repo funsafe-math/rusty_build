@@ -1,636 +1,319 @@
-use crate::job::{JobRecord, JobSnapshot};
+use crate::job::Job;
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap},
-    ffi::OsString,
-    path::{Component, Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ArtifactId {
-    pub path: PathBuf,
-    pub version: u32,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Edge {
     pub from: usize,
     pub to: usize,
-    pub reason: String,
 }
 
-/// An explicit semantic prerequisite, identified by original input lines so it
-/// remains valid when rewrites fuse executable nodes and retain provenance.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RequiredDependency {
-    pub producer_line: usize,
-    pub consumer_line: usize,
-    pub artifact: PathBuf,
-    pub reason: String,
-}
-#[derive(Clone, Debug, Serialize)]
-pub struct BuildGraph {
-    pub jobs: Vec<JobRecord>,
+#[derive(Debug)]
+pub struct Dag {
+    pub jobs: Vec<Box<dyn Job>>,
     pub edges: Vec<Edge>,
-    pub required_dependencies: Vec<RequiredDependency>,
     pub waves: Vec<Vec<usize>>,
-    pub cwd: PathBuf,
-    pub reads: Vec<Vec<ArtifactId>>,
-    pub writes: Vec<Vec<ArtifactId>>,
-    pub decisions: Vec<String>,
-    pub diagnostics: Vec<crate::input::SourceDiagnostic>,
-    /// Original jobs replaced by each executable node, in their original order.
-    pub provenance: Vec<Vec<JobRecord>>,
+    pub unproduced: Vec<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-struct StoredGraph {
-    jobs: Vec<JobSnapshot>,
-    provenance: Vec<Vec<JobSnapshot>>,
-    cwd: PathBuf,
-    #[serde(default)]
-    edges: Vec<Edge>,
-    #[serde(default)]
-    required_dependencies: Vec<RequiredDependency>,
-    #[serde(default)]
-    decisions: Vec<String>,
-    #[serde(default)]
-    diagnostics: Vec<crate::input::SourceDiagnostic>,
-}
-
-/// Resolve existing ancestors to expose aliases, then normalize missing suffixes.
-/// Backslash is not a path separator on POSIX.
-pub fn normalize(cwd: &Path, path: &Path) -> PathBuf {
-    normalize_with(cwd, path, |path| path.canonicalize().ok())
-}
-
-fn normalize_with(
-    cwd: &Path,
-    path: &Path,
-    mut canonicalize: impl FnMut(&Path) -> Option<PathBuf>,
-) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    };
-    let mut resolved = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            c => {
-                resolved.push(c.as_os_str());
-                if let Some(existing) = canonicalize(&resolved) {
-                    resolved = existing;
-                }
-            }
-        }
-    }
-    resolved
-}
-/// Filesystem observations belong to one rebuild, including failed lookups:
-/// independent outputs usually share most of their existing ancestors.
 #[derive(Default)]
-struct PathCache {
-    normalized: HashMap<PathBuf, PathBuf>,
-    canonical: HashMap<PathBuf, Option<PathBuf>>,
-    aliases: HashMap<PathBuf, bool>,
+struct PathNode {
+    children: BTreeMap<String, usize>,
+    parent: Option<usize>,
+    writers: Vec<usize>,
 }
 
-impl PathCache {
-    fn normalize(&mut self, cwd: &Path, path: &Path) -> PathBuf {
-        if let Some(normalized) = self.normalized.get(path) {
-            return normalized.clone();
-        }
-        let normalized = normalize_with(cwd, path, |prefix| {
-            if let Some(canonical) = self.canonical.get(prefix) {
-                return canonical.clone();
-            }
-            let canonical = prefix.canonicalize().ok();
-            self.canonical.insert(prefix.to_owned(), canonical.clone());
-            canonical
-        });
-        self.normalized.insert(path.to_owned(), normalized.clone());
-        normalized
-    }
-
-    fn aliased(&mut self, path: &Path) -> bool {
-        if let Some(&aliased) = self.aliases.get(path) {
-            return aliased;
-        }
-        let aliased = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.nlink() > 1)
-            }
-            #[cfg(not(unix))]
-            {
-                false
-            }
-        };
-        self.aliases.insert(path.to_owned(), aliased);
-        aliased
-    }
+// Forward slashes delimit components; a directory's trailing slash adds no
+// component. Original strings remain untouched.
+pub(crate) fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.split_terminator('/')
 }
 
-/// Exact-path users live at trie nodes. A query visits only its ancestors and
-/// descendants, never sibling paths, and collects jobs deterministically.
 #[derive(Default)]
-struct HazardIndex {
-    users: BTreeSet<usize>,
-    children: HashMap<OsString, HazardIndex>,
+struct Paths {
+    nodes: Vec<PathNode>,
+    ids: HashMap<String, usize>,
 }
 
-impl HazardIndex {
-    fn insert(&mut self, path: &Path, job: usize) {
-        let mut node = self;
-        for component in path.components() {
-            let key = component.as_os_str();
-            if !node.children.contains_key(key) {
-                node.children.insert(key.to_owned(), Self::default());
-            }
-            node = node.children.get_mut(key).expect("inserted hazard path");
+impl Paths {
+    fn insert(&mut self, path: &str) -> usize {
+        if let Some(&id) = self.ids.get(path) {
+            return id;
         }
-        node.users.insert(job);
-    }
-
-    fn overlapping(
-        &self,
-        path: &Path,
-        predecessors: &mut BTreeMap<usize, &'static str>,
-        reason: &'static str,
-    ) {
-        let mut node = self;
-        for component in path.components() {
-            for &job in &node.users {
-                predecessors.entry(job).or_insert(reason);
-            }
-            let Some(child) = node.children.get(component.as_os_str()) else {
-                return;
+        if self.nodes.is_empty() {
+            self.nodes.push(PathNode::default());
+        }
+        let mut node = 0;
+        for part in components(path) {
+            node = if let Some(&child) = self.nodes[node].children.get(part) {
+                child
+            } else {
+                let child = self.nodes.len();
+                self.nodes.push(PathNode {
+                    parent: Some(node),
+                    ..Default::default()
+                });
+                self.nodes[node].children.insert(part.to_owned(), child);
+                child
             };
-            node = child;
         }
-        node.collect(predecessors, reason);
+        self.ids.insert(path.to_owned(), node);
+        node
     }
 
-    fn collect(&self, predecessors: &mut BTreeMap<usize, &'static str>, reason: &'static str) {
-        for &job in &self.users {
-            predecessors.entry(job).or_insert(reason);
-        }
-        for child in self.children.values() {
-            child.collect(predecessors, reason);
-        }
-    }
-}
-
-/// Execution paths must accept ordinary forward-slash recipe operands.
-/// Windows canonicalize produces a verbatim prefix with different join rules;
-/// reserve canonicalization for hazard identities, not the execution cwd.
-fn execution_cwd(cwd: &Path) -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        use std::path::Prefix;
-        let absolute = std::path::absolute(cwd).context("resolve build working directory")?;
-        if !absolute
-            .metadata()
-            .context("inspect build working directory")?
-            .is_dir()
-        {
-            bail!(
-                "build working directory is not a directory: {}",
-                absolute.display()
-            );
-        }
-        let mut components = absolute.components();
-        // Older saved plans already contain canonicalize's verbatim spelling.
-        // Convert only those typed prefixes, never arbitrary path characters.
-        let mut ordinary = match components.next() {
-            Some(Component::Prefix(prefix)) => match prefix.kind() {
-                Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
-                Prefix::VerbatimUNC(server, share) => Path::new(r"\\").join(server).join(share),
-                _ => return Ok(absolute),
-            },
-            _ => return Ok(absolute),
-        };
-        ordinary.extend(components);
-        Ok(ordinary)
-    }
-    #[cfg(not(windows))]
-    {
-        cwd.canonicalize()
-            .context("resolve build working directory")
-    }
-}
-
-impl BuildGraph {
-    pub fn new(jobs: Vec<JobRecord>, cwd: &Path) -> Result<Self> {
-        let cwd = execution_cwd(cwd)?;
-        let mut graph = Self {
-            provenance: jobs.iter().cloned().map(|j| vec![j]).collect(),
-            jobs,
-            edges: vec![],
-            required_dependencies: vec![],
-            waves: vec![],
-            cwd,
-            reads: vec![],
-            writes: vec![],
-            decisions: vec![],
-            diagnostics: vec![],
-        };
-        graph.rebuild()?;
-        Ok(graph)
-    }
-    /// Rehydrate every typed job using an explicit registry before exposing a
-    /// runnable graph. Unknown types/versions fail; no placeholder executors.
-    pub fn from_json(bytes: &[u8], registry: &crate::registry::Registry) -> Result<Self> {
-        let stored: StoredGraph = serde_json::from_slice(bytes).context("decode execution plan")?;
-        let jobs = stored
-            .jobs
-            .into_iter()
-            .map(|job| registry.restore(job))
-            .collect::<Result<Vec<_>>>()?;
-        let provenance = stored
-            .provenance
-            .into_iter()
-            .map(|originals| {
-                originals
-                    .into_iter()
-                    .map(|job| registry.restore(job))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if provenance.len() != jobs.len() {
-            bail!("plan provenance does not match executable node count");
-        }
-        if jobs.iter().zip(&provenance).any(|(job, originals)| {
-            !originals
-                .iter()
-                .any(|original| original.source.line == job.source.line)
-        }) {
-            bail!("plan provenance omits an executable node's source identity");
-        }
-        let mut graph = Self {
-            jobs,
-            provenance,
-            cwd: execution_cwd(&stored.cwd)?,
-            edges: vec![],
-            required_dependencies: stored.required_dependencies,
-            waves: vec![],
-            reads: vec![],
-            writes: vec![],
-            decisions: stored.decisions,
-            diagnostics: stored.diagnostics,
-        };
-        graph.rebuild()?;
-        let mut edge_pairs: BTreeSet<_> = graph
-            .edges
-            .iter()
-            .map(|edge| (edge.from, edge.to))
-            .collect();
-        for edge in stored.edges {
-            if edge_pairs.insert((edge.from, edge.to)) {
-                graph.edges.push(edge);
+    fn overlapping(&self, node: usize) -> Vec<usize> {
+        let mut result = Vec::new();
+        let mut parent = self.nodes[node].parent;
+        while let Some(id) = parent {
+            if !self.nodes[id].writers.is_empty() {
+                result.push(id);
             }
+            parent = self.nodes[id].parent;
         }
-        graph.waves = graph.topological_waves()?;
-        Ok(graph)
+        let mut pending = vec![node];
+        while let Some(id) = pending.pop() {
+            if !self.nodes[id].writers.is_empty() {
+                result.push(id);
+            }
+            pending.extend(self.nodes[id].children.values().copied());
+        }
+        result
     }
+}
 
+pub fn create_graph(jobs: Vec<Box<dyn Job>>) -> Result<Dag> {
+    let mut dag = Dag {
+        jobs,
+        edges: Vec::new(),
+        waves: Vec::new(),
+        unproduced: Vec::new(),
+    };
+    dag.rebuild()?;
+    Ok(dag)
+}
+
+impl Dag {
     pub fn rebuild(&mut self) -> Result<()> {
-        self.edges.clear();
-        self.reads.clear();
-        self.writes.clear();
-        for job in &mut self.jobs {
-            job.refine_effects(&self.cwd)?;
-        }
-        let mut paths = PathCache::default();
-        let mut versions = std::collections::BTreeMap::<PathBuf, u32>::new();
-        let inputs: Vec<Vec<PathBuf>> = self
-            .jobs
-            .iter()
-            .map(|j| {
-                j.spec
-                    .inputs
-                    .iter()
-                    .map(|p| paths.normalize(&self.cwd, p))
-                    .collect()
-            })
-            .collect();
-        let outputs: Vec<Vec<PathBuf>> = self
-            .jobs
-            .iter()
-            .map(|j| {
-                let mut effects: BTreeSet<PathBuf> = j
-                    .spec
-                    .outputs
-                    .iter()
-                    .map(|p| paths.normalize(&self.cwd, p))
-                    .collect();
-                if j.spec.creates_parents {
-                    // A job may create ancestors of its declared outputs.
-                    // Include them even if present: earlier barriers may remove them.
-                    let directories: Vec<_> = effects.iter().cloned().collect();
-                    for directory in directories {
-                        for parent in directory.ancestors().skip(1) {
-                            if parent == self.cwd || parent.parent().is_none() {
-                                break;
-                            }
-                            effects.insert(parent.to_owned());
-                        }
-                    }
+        let mut paths = Paths::default();
+        for (index, job) in self.jobs.iter().enumerate() {
+            for access in &job.data().accesses {
+                let id = paths.insert(&access.path);
+                if access.access.writes() && paths.nodes[id].writers.last() != Some(&index) {
+                    paths.nodes[id].writers.push(index);
                 }
-                effects.into_iter().collect()
-            })
-            .collect();
-        let mut required_pairs = BTreeSet::new();
-        let mut required = Vec::with_capacity(self.required_dependencies.len());
-        let mut final_reads = std::collections::BTreeMap::<usize, BTreeSet<PathBuf>>::new();
-        for (index, dependency) in self.required_dependencies.iter().enumerate() {
-            let producer = self.node_for_source_line(dependency.producer_line)?;
-            let consumer = self.node_for_source_line(dependency.consumer_line)?;
-            if producer == consumer {
-                bail!(
-                    "required dependency resolves to the same executable node: source line {}",
-                    dependency.consumer_line
-                );
             }
-            let artifact = paths.normalize(&self.cwd, &dependency.artifact);
-            if !outputs[producer].contains(&artifact) {
-                bail!(
-                    "required producer line {} does not declare output {}",
-                    dependency.producer_line,
-                    artifact.display()
-                );
-            }
-            required_pairs.insert((producer, consumer));
-            final_reads.entry(consumer).or_default().insert(artifact);
-            required.push((producer, consumer, index));
         }
-        let mut final_versions = std::collections::BTreeMap::<PathBuf, u32>::new();
-        for (&consumer, artifacts) in &final_reads {
-            for artifact in artifacts {
-                if !final_versions.contains_key(artifact) {
-                    final_versions.insert(artifact.clone(), 0);
+        // Resolve matching writer nodes once per spelling, not once per access.
+        let overlaps: HashMap<_, _> = paths
+            .ids
+            .values()
+            .copied()
+            .map(|id| (id, paths.overlapping(id)))
+            .collect();
+        let mut edges = BTreeSet::new();
+        let mut unproduced = vec![Vec::new(); self.jobs.len()];
+        let mut bindings = Vec::with_capacity(self.jobs.len());
+        let mut producer_pairs = BTreeSet::new();
+        for (consumer, job) in self.jobs.iter().enumerate() {
+            let mut bound = HashMap::new();
+            for producer in &job.data().producers {
+                if producer.job >= self.jobs.len() || producer.job == consumer {
+                    bail!("invalid producer {} for job {consumer}", producer.job);
                 }
-                for (producer, paths) in outputs.iter().enumerate() {
-                    if paths.contains(artifact) && !required_pairs.contains(&(producer, consumer)) {
+                if !job
+                    .data()
+                    .accesses
+                    .iter()
+                    .any(|a| a.access.reads() && a.path == producer.input)
+                {
+                    bail!(
+                        "producer binding for unread input {:?} at job {consumer}",
+                        producer.input
+                    );
+                }
+                let id = paths.ids[&producer.input];
+                if !overlaps[&id].iter().any(|&node| {
+                    paths.nodes[node]
+                        .writers
+                        .binary_search(&producer.job)
+                        .is_ok()
+                }) {
+                    bail!("job {} does not produce {:?}", producer.job, producer.input);
+                }
+                if let Some(previous) = bound.insert(producer.input.as_str(), producer.job) {
+                    if previous != producer.job {
                         bail!(
-                            "final-artifact dependency {} is missing producer line {} for consumer line {}",
-                            artifact.display(),
-                            self.jobs[producer].source.line,
-                            self.jobs[consumer].source.line
+                            "multiple producers bound to {:?} at job {consumer}",
+                            producer.input
                         );
                     }
                 }
+                edges.insert((producer.job, consumer));
+                producer_pairs.insert((producer.job, consumer));
             }
+            bindings.push(bound);
         }
-        if !final_versions.is_empty() {
-            for path in outputs.iter().flatten() {
-                if let Some(version) = final_versions.get_mut(path) {
-                    *version += 1;
-                }
-            }
-        }
-        // Different hardlink names are aliases that lexical paths cannot expose.
-        // Keep any such operation behind a barrier instead of guessing independence.
-        let aliased: Vec<bool> = inputs
-            .iter()
-            .zip(&outputs)
-            .map(|(reads, writes)| reads.iter().chain(writes).any(|path| paths.aliased(path)))
-            .collect();
-        let barriers: Vec<bool> = self
-            .jobs
-            .iter()
-            .zip(&aliased)
-            .map(|(job, aliased)| job.spec.unknown_effects || *aliased)
-            .collect();
-        let mut writers = HazardIndex::default();
-        let mut readers = HazardIndex::default();
-        let mut frontier = BTreeSet::new();
-        let mut last_barrier = None;
-        let mut prior_barriers = Vec::new();
-        let hoisting = required_pairs
-            .iter()
-            .any(|&(producer, consumer)| producer > consumer);
-        for i in 0..self.jobs.len() {
-            self.reads.push(
-                inputs[i]
-                    .iter()
-                    .map(|p| ArtifactId {
-                        path: p.clone(),
-                        version: if final_reads.get(&i).is_some_and(|paths| paths.contains(p)) {
-                            *final_versions.get(p).unwrap_or(&0)
-                        } else {
-                            *versions.get(p).unwrap_or(&0)
-                        },
-                    })
-                    .collect(),
-            );
-            self.writes.push(
-                outputs[i]
-                    .iter()
-                    .map(|p| {
-                        let v = versions.entry(p.clone()).or_default();
-                        *v += 1;
-                        ArtifactId {
-                            path: p.clone(),
-                            version: *v,
+        for (index, job) in self.jobs.iter().enumerate() {
+            for access in &job.data().accesses {
+                let id = paths.ids[&access.path];
+                let matching = &overlaps[&id];
+                if access.access.writes() {
+                    for &node in matching {
+                        let writers = &paths.nodes[node].writers;
+                        let before = writers.partition_point(|&writer| writer < index);
+                        if before != 0 {
+                            edges.insert((writers[before - 1], index));
                         }
-                    })
-                    .collect(),
-            );
-            let mut predecessors = BTreeMap::new();
-            // Retain every actual hazard (and the original reason precedence),
-            // even when its ordering is also implied by a barrier.
-            for path in &inputs[i] {
-                writers.overlapping(
-                    path,
-                    &mut predecessors,
-                    "read after write / directory prerequisite",
-                );
-            }
-            for path in &outputs[i] {
-                writers.overlapping(path, &mut predecessors, "write after write");
-            }
-            for path in &outputs[i] {
-                readers.overlapping(path, &mut predecessors, "write after read");
-            }
-            const BARRIER: &str = "unknown-effect or filesystem-alias ordering barrier";
-            if hoisting {
-                // A backward explicit requirement can remove one particular
-                // consumer->producer barrier, but must not remove intervening
-                // paths that reveal an unsafe hoist as a cycle. Keep the exact
-                // barrier relation for this policy-only case. Path hazards are
-                // still indexed; ordinary plans use the linear frontier below.
-                let mut add_barrier = |prior| {
-                    let reverse_prerequisite =
-                        required_pairs.contains(&(i, prior)) && !barriers[i] && !aliased[prior];
-                    if !reverse_prerequisite {
-                        predecessors.entry(prior).or_insert(BARRIER);
-                    }
-                };
-                if barriers[i] {
-                    for prior in 0..i {
-                        add_barrier(prior);
-                    }
-                } else {
-                    for &prior in &prior_barriers {
-                        add_barrier(prior);
                     }
                 }
-            } else if barriers[i] {
-                // All earlier nodes reach a current sink. Joining those sinks
-                // orders the entire prefix without a dense all-pairs barrier.
-                for &prior in &frontier {
-                    predecessors.entry(prior).or_insert(BARRIER);
+                if !access.access.reads() {
+                    continue;
                 }
-            } else if let Some(prior) = last_barrier {
-                predecessors.entry(prior).or_insert(BARRIER);
-            }
-            for (prior, reason) in predecessors {
-                if !hoisting {
-                    frontier.remove(&prior);
+                let explicit = bindings[index].get(access.path.as_str()).copied();
+                let mut produced = explicit.is_some();
+                let boundary = explicit.unwrap_or(index);
+                for &node in matching {
+                    let writers = &paths.nodes[node].writers;
+                    if explicit.is_none() {
+                        let before = writers.partition_point(|&writer| writer < index);
+                        if before != 0 {
+                            edges.insert((writers[before - 1], index));
+                            produced |= node == id;
+                        }
+                    }
+                    let after = writers.partition_point(|&writer| writer <= boundary);
+                    // A read-modify-write consumes its incoming value, not itself.
+                    if let Some(&next) = writers[after..].iter().find(|&&writer| writer != index) {
+                        edges.insert((index, next));
+                    }
                 }
-                self.edges.push(Edge {
-                    from: prior,
-                    to: i,
-                    reason: reason.into(),
-                });
-            }
-            if !hoisting {
-                frontier.insert(i);
-            }
-            if barriers[i] {
-                if hoisting {
-                    prior_barriers.push(i);
-                } else {
-                    last_barrier = Some(i);
+                if !produced && !unproduced[index].contains(&access.path) {
+                    unproduced[index].push(access.path.clone());
                 }
-            }
-            // Final-artifact policy reads deliberately do not cause a WAR at
-            // their original log position; all other reads do.
-            for path in &inputs[i] {
-                if !final_reads
-                    .get(&i)
-                    .is_some_and(|paths| paths.contains(path))
-                {
-                    readers.insert(path, i);
-                }
-            }
-            for path in &outputs[i] {
-                writers.insert(path, i);
             }
         }
-        for (producer, consumer, index) in required {
-            let reason = &self.required_dependencies[index].reason;
-            if let Some(edge) = self
-                .edges
-                .iter_mut()
-                .find(|e| e.from == producer && e.to == consumer)
+        // Reversing two barriers breaks the ordinary frontier's transitivity.
+        // Retain every original constraint touching those exceptional barriers.
+        let mut reversed_barriers = BTreeSet::new();
+        for &(producer, consumer) in &producer_pairs {
+            if producer > consumer
+                && self.jobs[producer].data().unknown_effects
+                && self.jobs[consumer].data().unknown_effects
             {
-                if !edge.reason.split("; ").any(|part| part == reason.as_str()) {
-                    edge.reason.push_str("; ");
-                    edge.reason.push_str(reason);
-                }
-            } else {
-                self.edges.push(Edge {
-                    from: producer,
-                    to: consumer,
-                    reason: reason.clone(),
-                });
+                reversed_barriers.extend([producer, consumer]);
             }
         }
-        self.waves = self.topological_waves()?;
+        let mut previous_barrier = None;
+        let mut segment = Vec::new();
+        let mut barrier_edge = |from, to| {
+            if producer_pairs.contains(&(to, from)) {
+                edges.insert((to, from));
+            } else {
+                edges.insert((from, to));
+            }
+        };
+        for barrier in reversed_barriers {
+            for other in 0..self.jobs.len() {
+                if other != barrier {
+                    barrier_edge(barrier.min(other), barrier.max(other));
+                }
+            }
+        }
+        for (index, job) in self.jobs.iter().enumerate() {
+            if job.data().unknown_effects {
+                if let Some(previous) = previous_barrier {
+                    barrier_edge(previous, index);
+                }
+                for before in segment.drain(..) {
+                    barrier_edge(before, index);
+                }
+                previous_barrier = Some(index);
+            } else {
+                if let Some(previous) = previous_barrier {
+                    barrier_edge(previous, index);
+                }
+                segment.push(index);
+            }
+        }
+        let edges: Vec<_> = edges
+            .into_iter()
+            .map(|(from, to)| Edge { from, to })
+            .collect();
+        let waves = topological_waves(self.jobs.len(), &edges)?;
+        self.edges = edges;
+        self.waves = waves;
+        self.unproduced = unproduced;
         Ok(())
     }
-    fn node_for_source_line(&self, line: usize) -> Result<usize> {
-        let mut nodes = self
-            .provenance
-            .iter()
-            .enumerate()
-            .filter(|(_, originals)| originals.iter().any(|job| job.source.line == line))
-            .map(|(index, _)| index);
-        let Some(node) = nodes.next() else {
-            bail!("required dependency source line {line} is absent from graph provenance");
-        };
-        if nodes.next().is_some() {
-            bail!("required dependency source line {line} is ambiguous");
+
+    pub fn check_inputs(&self) -> Result<()> {
+        for (index, job) in self.jobs.iter().enumerate() {
+            let inputs: Vec<_> = self.unproduced[index].iter().map(String::as_str).collect();
+            job.check_inputs(&inputs)
+                .with_context(|| format!("checking inputs for job {index} ({})", job.name()))?;
         }
-        Ok(node)
+        Ok(())
     }
 
     pub fn topological_waves(&self) -> Result<Vec<Vec<usize>>> {
-        let mut degree = vec![0; self.jobs.len()];
-        let mut next = vec![vec![]; self.jobs.len()];
-        let mut unique = BTreeSet::new();
-        for edge in &self.edges {
-            if edge.from >= degree.len() || edge.to >= degree.len() {
-                bail!("dependency edge has invalid node index");
-            }
-            if unique.insert((edge.from, edge.to)) {
-                degree[edge.to] += 1;
-                next[edge.from].push(edge.to);
-            }
-        }
-        let mut ready: Vec<usize> = degree
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &n)| (n == 0).then_some(i))
-            .collect();
-        let mut waves = Vec::new();
-        let mut visited = 0;
-        while !ready.is_empty() {
-            visited += ready.len();
-            let mut following = BTreeSet::new();
-            for &i in &ready {
-                for &child in &next[i] {
-                    degree[child] -= 1;
-                    if degree[child] == 0 {
-                        following.insert(child);
-                    }
+        topological_waves(self.jobs.len(), &self.edges)
+    }
+
+    pub fn batches(&self) -> Vec<Vec<usize>> {
+        self.batches_in(&self.waves)
+    }
+
+    pub(crate) fn batches_in(&self, waves: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        let mut batches = Vec::new();
+        for wave in waves {
+            let mut groups: Vec<(std::any::TypeId, Vec<usize>)> = Vec::new();
+            for &index in wave {
+                let kind = (self.jobs[index].as_ref() as &dyn Any).type_id();
+                if let Some((_, group)) = groups.iter_mut().find(|(id, _)| *id == kind) {
+                    group.push(index);
+                } else {
+                    groups.push((kind, vec![index]));
                 }
             }
-            waves.push(ready);
-            ready = following.into_iter().collect();
+            batches.extend(groups.into_iter().map(|(_, group)| group));
         }
-        if visited != self.jobs.len() {
-            let blocked: Vec<_> = degree
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| **d > 0)
-                .map(|(i, _)| {
-                    format!(
-                        "node {i}, line {}: {}",
-                        self.jobs[i].source.line, self.jobs[i].source.text
-                    )
-                })
-                .collect();
-            bail!("dependency cycle: {}", blocked.join("; "));
-        }
-        Ok(waves)
+        batches
     }
-    pub fn dot(&self) -> String {
-        let mut out = String::from("digraph rusty_make {\n");
-        for (i, j) in self.jobs.iter().enumerate() {
-            let label = format!("{i}: {} [{:?}]\n{}", j.spec.kind, j.strategy, j.source.text);
-            out.push_str(&format!(
-                "  n{i} [label={}];\n",
-                serde_json::to_string(&label).unwrap()
-            ));
+}
+
+pub(crate) fn topological_waves(count: usize, edges: &[Edge]) -> Result<Vec<Vec<usize>>> {
+    let mut successors = vec![Vec::new(); count];
+    let mut indegree = vec![0; count];
+    for edge in edges {
+        if edge.from >= count || edge.to >= count {
+            bail!("edge endpoint outside graph: {} -> {}", edge.from, edge.to);
         }
-        for edge in &self.edges {
-            out.push_str(&format!(
-                "  n{} -> n{} [label={}];\n",
-                edge.from,
-                edge.to,
-                serde_json::to_string(&edge.reason).unwrap()
-            ));
-        }
-        out.push_str("}\n");
-        out
+        successors[edge.from].push(edge.to);
+        indegree[edge.to] += 1;
     }
+    let mut ready: Vec<_> = (0..count).filter(|&index| indegree[index] == 0).collect();
+    let mut waves = Vec::new();
+    let mut visited = 0;
+    while !ready.is_empty() {
+        ready.sort_unstable();
+        visited += ready.len();
+        let mut next = Vec::new();
+        for &node in &ready {
+            for &successor in &successors[node] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    next.push(successor);
+                }
+            }
+        }
+        waves.push(ready);
+        ready = next;
+    }
+    if visited != count {
+        bail!("dependency cycle in job graph");
+    }
+    Ok(waves)
 }

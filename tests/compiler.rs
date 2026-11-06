@@ -1,174 +1,231 @@
 use rusty_make::{
-    compdb::CompilationDatabase,
-    parse_plan,
-    registry::Registry,
-    scheduler::{RunOptions, run},
+    commands::compiler::Compiler, graph::create_graph, job::FileAccess, parse, registry::Registry,
+    scheduler::execute, shell::ShellHints,
 };
-use std::{fs, process::Command};
+use std::{any::Any, fs, process::Command};
+
+fn compiler(args: &[&str]) -> Compiler {
+    let argv = std::iter::once("cc")
+        .chain(args.iter().copied())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Compiler::parse(&argv, &ShellHints::default()).unwrap()
+}
 
 #[test]
-fn include_and_library_paths_survive_unknown_flags_and_database_export() {
-    let root = tempfile::tempdir().unwrap();
-    let text = "gcc -Wall -Wextra -std=c11 -I include -I'other include' -L lib -L'other lib' -c main.c -o main.o\n";
-    let graph = parse_plan(text, root.path(), &Registry::default()).unwrap();
-    let job = &graph.jobs[0];
+fn original_argv_and_string_metadata_survive_unknown_flags() {
+    let argv = [
+        "/tool chain/custom cc",
+        "-Wall",
+        "-Wextra",
+        "-std=c11",
+        "-I",
+        "include",
+        "-Iother include",
+        "-L",
+        "lib",
+        "-Lother lib",
+        "-DANSWER=42",
+        "-O2",
+        "-g",
+        "-c",
+        "./main.c",
+        "-o",
+        "obj/../main.o",
+    ]
+    .map(str::to_owned);
+    let job = Compiler::parse(&argv, &ShellHints::default()).unwrap();
+    assert_eq!(job.argv, argv);
+    assert_eq!(job.sources, ["./main.c"]);
+    assert_eq!(job.inputs, ["./main.c"]);
+    assert_eq!(job.outputs, ["obj/../main.o"]);
+    assert_eq!(job.include_dirs, ["include", "other include"]);
+    assert_eq!(job.library_paths, ["lib", "other lib"]);
+    assert_eq!(job.defines, ["ANSWER=42"]);
+    assert_eq!(job.optimization, ["2"]);
+    assert_eq!(job.debug, ["2"]);
+    assert_eq!(job.unparsed_args, ["-Wall", "-Wextra", "-std=c11"]);
+    assert!(!job.metadata_complete);
     assert_eq!(
-        job.spec.parsed["includes"],
-        serde_json::json!(["include", "other include"])
-    );
-    assert_eq!(
-        job.spec.parsed["library_paths"],
-        serde_json::json!(["lib", "other lib"])
-    );
-    assert_eq!(
-        job.spec.parsed["unparsed_args"],
-        serde_json::json!(["-Wall", "-Wextra", "-std=c11"])
-    );
-    assert!(job.spec.unknown_effects && !job.spec.cacheable);
-    let database = CompilationDatabase::from_graph(&graph).unwrap();
-    assert_eq!(database.commands[0].file, "main.c");
-    assert_eq!(
-        database.commands[0].arguments,
-        vec![
-            "gcc",
-            "-Wall",
-            "-Wextra",
-            "-std=c11",
-            "-I",
-            "include",
-            "-Iother include",
-            "-L",
-            "lib",
-            "-Lother lib",
-            "-c",
-            "main.c",
-            "-o",
-            "main.o"
+        job.data.accesses,
+        [
+            FileAccess::read("./main.c"),
+            FileAccess::write("obj/../main.o")
         ]
     );
+    assert!(job.data.unknown_effects);
 }
 
 #[test]
-fn unknown_option_operands_and_response_files_are_not_guessed_as_sources() {
-    let root = tempfile::tempdir().unwrap();
-    let graph = parse_plan(
-        "gcc -include generated.c -c main.c -o main.o\ngcc @args.rsp\n",
-        root.path(),
-        &Registry::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        graph.jobs[0].spec.parsed["sources"],
-        serde_json::json!(["main.c"])
-    );
-    assert_eq!(
-        graph.jobs[0].spec.parsed["unparsed_args"],
-        serde_json::json!(["-include", "generated.c"])
-    );
-    assert_eq!(graph.jobs[1].spec.parsed["sources"], serde_json::json!([]));
-    assert!(graph.jobs[1].spec.outputs.is_empty());
-    let db = CompilationDatabase::from_graph(&graph).unwrap();
-    assert_eq!(
-        db.commands
-            .iter()
-            .map(|c| c.file.as_str())
-            .collect::<Vec<_>>(),
-        vec!["main.c"]
-    );
+fn unknown_option_arity_and_response_file_contents_are_never_guessed() {
+    let job = compiler(&[
+        "-include",
+        "generated.c",
+        "extra.c",
+        "-c",
+        "main.c",
+        "-o",
+        "main.o",
+    ]);
+    assert_eq!(job.sources, ["main.c"]);
+    assert_eq!(job.unparsed_args, ["-include", "generated.c", "extra.c"]);
+    let unknown = compiler(&["-future-option", "maybe.c"]);
+    assert!(unknown.sources.is_empty());
+    assert!(unknown.outputs.is_empty());
+    let response = compiler(&["@args.rsp"]);
+    assert!(response.inputs.is_empty());
+    assert!(response.outputs.is_empty());
+    assert!(response.data.unknown_effects);
+    let explicit = compiler(&["-unknown", "value.c", "-c", "--", "-literal.c"]);
+    assert_eq!(explicit.sources, ["-literal.c"]);
+    assert_eq!(explicit.unparsed_args, ["-unknown", "value.c"]);
 }
 
 #[test]
-fn extended_optimization_and_debug_flags_are_forwarded_not_rejected() {
-    let root = tempfile::tempdir().unwrap();
-    let graph = parse_plan(
-        "gcc -Ofuture -ggdb -c main.c -o main.o\n",
-        root.path(),
-        &Registry::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        graph.jobs[0].spec.parsed["unparsed_args"],
-        serde_json::json!(["-Ofuture", "-ggdb"])
+fn include_categories_and_default_outputs_are_understood_but_effects_stay_conservative() {
+    let job = compiler(&[
+        "-isystemsystem",
+        "-Ilocal",
+        "-iquote",
+        "quoted",
+        "-idirafterafter",
+        "-c",
+        "src/a.c",
+        "src/b.cpp",
+    ]);
+    assert_eq!(job.include_dirs, ["local", "system", "quoted", "after"]);
+    assert_eq!(job.outputs, ["a.o", "b.o"]);
+    assert!(job.metadata_complete);
+    assert!(
+        job.data.unknown_effects,
+        "implicit includes and compiler/toolchain effects remain unaccounted"
     );
+    let header = compiler(&["-c", "include/api.h"]);
+    assert_eq!(header.outputs, ["include/api.h.gch"]);
+    let link = compiler(&["a.o", "b.c"]);
+    assert_eq!(link.sources, ["b.c"]);
     assert_eq!(
-        graph.jobs[0].spec.parsed["sources"],
-        serde_json::json!(["main.c"])
+        link.outputs,
+        [if cfg!(windows) { "a.exe" } else { "a.out" }]
     );
+    let extensions = compiler(&["-Ofuture", "-ggdb", "-c", "main.c", "-o", "main.o"]);
+    assert_eq!(extensions.unparsed_args, ["-Ofuture", "-ggdb"]);
+    assert_eq!(extensions.sources, ["main.c"]);
 }
 
 #[test]
-fn real_compiler_uses_include_and_library_paths_with_passthrough_flags() {
-    for tool in ["cc", "ar"] {
-        if Command::new(tool).arg("--version").output().is_err() {
-            eprintln!("skipping unavailable compiler fixture tool: {tool}");
-            return;
-        }
+fn known_options_require_values_and_keep_hyphen_path_values() {
+    for args in [
+        vec![],
+        vec!["-I"],
+        vec!["-L"],
+        vec!["-D"],
+        vec!["-o"],
+        vec!["-c", "a.c", "b.c", "-o", "one.o"],
+    ] {
+        let argv = std::iter::once("cc")
+            .chain(args)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            Compiler::parse(&argv, &ShellHints::default()).is_err(),
+            "{argv:?}"
+        );
     }
+    let job = compiler(&[
+        "-I",
+        "-headers",
+        "-L",
+        "-libraries",
+        "-c",
+        "main.c",
+        "-o",
+        "main.o",
+    ]);
+    assert_eq!(job.include_dirs, ["-headers"]);
+    assert_eq!(job.library_paths, ["-libraries"]);
+}
+
+#[test]
+fn compiler_preflight_checks_declared_inputs_without_creating_outputs() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("missing.c");
+    let output = root.path().join("main.o");
+    let text = format!("cc -c '{}' -o '{}'\n", source.display(), output.display());
+    let dag = create_graph(parse(&text, &Registry::default()).unwrap()).unwrap();
+    assert!(dag.check_inputs().is_err());
+    assert!(!output.exists());
+    fs::write(&source, "int value(void) { return 42; }\n").unwrap();
+    dag.check_inputs().unwrap();
+    let ignored = create_graph(
+        parse(
+            &format!(
+                "cc -c '{}' -o '{}' || true\n",
+                root.path().join("ignored.c").display(),
+                output.display()
+            ),
+            &Registry::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    ignored.check_inputs().unwrap();
+}
+
+#[test]
+fn real_compiler_uses_original_include_and_library_arguments() {
     let root = tempfile::tempdir().unwrap();
     let p = root.path();
-    for dir in ["include one", "include2", "library one"] {
-        fs::create_dir(p.join(dir)).unwrap();
+    for directory in ["include one", "include2", "library one", "build"] {
+        fs::create_dir(p.join(directory)).unwrap();
     }
     fs::write(p.join("include one/value.h"), "int value(void);\n").unwrap();
     fs::write(p.join("include2/offset.h"), "#define OFFSET 5\n").unwrap();
     fs::write(p.join("value.c"), "int value(void) { return 7; }\n").unwrap();
     fs::write(p.join("main.c"), "#include <value.h>\n#include <offset.h>\n#include <stdio.h>\nint main(void) { printf(\"%d\\n\", value() + OFFSET); return value() + OFFSET == 12 ? 0 : 1; }\n").unwrap();
-    let text = "mkdir -p build\ncc -c value.c -o build/value.o\nar rcs 'library one/libvalue.a' build/value.o\ncc -Wall -Wextra -std=c11 -I 'include one' -Iinclude2 -L 'library one' -Llibrary2 -c main.c -o build/main.o\ncc build/main.o -L 'library one' -Llibrary2 -lvalue -o build/app\n";
-    let graph = parse_plan(text, p, &Registry::default()).unwrap();
-    run(
-        &graph,
-        &RunOptions {
-            jobs: 4,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let text = format!(
+        "cc -c '{}/value.c' -o '{}/build/value.o'\nar rcs '{}/library one/libvalue.a' '{}/build/value.o'\ncc -Wall -Wextra -std=c11 -I '{}/include one' -I'{}/include2' -L '{}/library one' -c '{}/main.c' -o '{}/build/main.o'\ncc '{}/build/main.o' -L '{}/library one' -lvalue -o '{}/build/app'\n",
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display(),
+    );
+    let jobs = parse(&text, &Registry::default()).unwrap();
+    let compile = (jobs[2].as_ref() as &dyn Any)
+        .downcast_ref::<Compiler>()
+        .unwrap();
+    assert!(compile.argv.iter().any(|arg| arg == "-Wall"));
+    let dag = create_graph(jobs).unwrap();
+    dag.check_inputs().unwrap();
+    execute(&dag, false).unwrap();
     let output = Command::new(p.join("build/app")).output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"12\n");
 }
 
 #[test]
-fn compiler_itself_rejects_invalid_forwarded_flags_and_stops_dependents() {
-    if Command::new("cc").arg("--version").output().is_err() {
-        return;
-    }
+fn invalid_forwarded_compiler_flag_stops_dependent_jobs() {
     let root = tempfile::tempdir().unwrap();
     let p = root.path();
     fs::write(p.join("main.c"), "int value(void) { return 1; }\n").unwrap();
-    let graph = parse_plan(
-        "cc --rusty-make-invalid-flag -c main.c -o main.o\ncp main.c should-not-exist\n",
-        p,
-        &Registry::default(),
-    )
-    .unwrap();
-    assert!(run(&graph, &RunOptions::default()).is_err());
+    let text = format!(
+        "cc --rusty-make-invalid-flag -c '{}/main.c' -o '{}/main.o'\ncp '{}/main.c' '{}/should-not-exist'\n",
+        p.display(),
+        p.display(),
+        p.display(),
+        p.display()
+    );
+    let dag = create_graph(parse(&text, &Registry::default()).unwrap()).unwrap();
+    dag.check_inputs().unwrap();
+    assert!(execute(&dag, false).is_err());
     assert!(!p.join("main.o").exists());
     assert!(!p.join("should-not-exist").exists());
-}
-
-#[test]
-fn known_options_still_require_values_and_preserve_hyphen_path_values() {
-    let root = tempfile::tempdir().unwrap();
-    let registry = Registry::default();
-    for command in ["cc -I\n", "cc -L\n", "cc -o\n", "cc -c a.c b.c -o one.o\n"] {
-        assert!(
-            parse_plan(command, root.path(), &registry).is_err(),
-            "{command}"
-        );
-    }
-    let graph = parse_plan(
-        "cc -I -headers -L -libraries -c main.c -o main.o\n",
-        root.path(),
-        &registry,
-    )
-    .unwrap();
-    assert_eq!(
-        graph.jobs[0].spec.parsed["includes"],
-        serde_json::json!(["-headers"])
-    );
-    assert_eq!(
-        graph.jobs[0].spec.parsed["library_paths"],
-        serde_json::json!(["-libraries"])
-    );
 }
